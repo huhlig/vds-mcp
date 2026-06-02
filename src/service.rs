@@ -44,7 +44,8 @@ use crate::storage::{DocumentStore, StorageError};
 
 /// VDS MCP server backed by a redb document store.
 pub struct VdsServer {
-    store: DocumentStore,
+    store: std::sync::RwLock<DocumentStore>,
+    database_path: std::sync::RwLock<PathBuf>,
 }
 
 impl VdsServer {
@@ -54,9 +55,54 @@ impl VdsServer {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let store = DocumentStore::open(&database)?;
         Ok(Self {
-            store: DocumentStore::open(database)?,
+            store: std::sync::RwLock::new(store),
+            database_path: std::sync::RwLock::new(database),
         })
+    }
+
+    /// Reopens the database at a new path.
+    /// This closes the current database and opens/creates a new one.
+    pub fn reopen_database(&self, new_path: PathBuf) -> Result<(), ServiceError> {
+        if let Some(parent) = new_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let new_store = DocumentStore::open(&new_path)?;
+        
+        *self.store.write().unwrap() = new_store;
+        *self.database_path.write().unwrap() = new_path;
+        
+        Ok(())
+    }
+
+    /// Gets the current database path.
+    pub fn get_database_path(&self) -> PathBuf {
+        self.database_path.read().unwrap().clone()
+    }
+
+    /// Sets the workspace directory and uses <workspace>/.vds/vds.db as the database path.
+    pub fn set_workspace_path(&self, workspace: PathBuf) -> Result<(), ServiceError> {
+        let database_path = workspace.join(".vds").join("vds.db");
+        self.reopen_database(database_path)
+    }
+
+    /// Gets the workspace directory (parent of .vds directory) if the database is in a .vds folder.
+    pub fn get_workspace_path(&self) -> Option<PathBuf> {
+        let db_path = self.database_path.read().unwrap();
+        db_path.parent()
+            .and_then(|parent| {
+                if parent.file_name()?.to_str()? == ".vds" {
+                    parent.parent().map(|p| p.to_path_buf())
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Helper to access the store - returns a guard that derefs to &DocumentStore
+    fn store(&self) -> std::sync::RwLockReadGuard<'_, DocumentStore> {
+        self.store.read().unwrap()
     }
 
     fn call(&self, name: &str, arguments: Option<JsonObject>) -> Result<Value, McpError> {
@@ -122,6 +168,10 @@ impl VdsServer {
             "lock_section" => self.to_value(self.lock_section(parse(arguments)?)),
             "unlock_section" => self.to_value(self.unlock_section(parse(arguments)?)),
             "check_conflicts" => self.to_value(self.check_conflicts(parse(arguments)?)),
+            "set_workspace" => self.to_value(self.set_workspace(parse(arguments)?)),
+            "get_workspace" => self.to_value(self.get_workspace(parse(arguments)?)),
+            "set_database" => self.to_value(self.set_database(parse(arguments)?)),
+            "get_database" => self.to_value(self.get_database(parse(arguments)?)),
             _ => Err(mcp_error(
                 McpErrorCode::InvalidInput,
                 format!("unknown tool: {name}"),
@@ -171,7 +221,7 @@ impl VdsServer {
     }
 
     fn require_document(&self, document_id: &DocumentId) -> McpResult<Document> {
-        self.store.get_document(document_id)?.ok_or_else(|| {
+        self.store().get_document(document_id)?.ok_or_else(|| {
             mcp_error(
                 McpErrorCode::NotFound,
                 format!("document not found: {}", document_id.as_str()),
@@ -184,7 +234,7 @@ impl VdsServer {
         document_id: &DocumentId,
         section_id: &SectionId,
     ) -> McpResult<Section> {
-        let section = self.store.get_section(section_id)?.ok_or_else(|| {
+        let section = self.store().get_section(section_id)?.ok_or_else(|| {
             mcp_error(
                 McpErrorCode::NotFound,
                 format!("section not found: {}", section_id.as_str()),
@@ -208,7 +258,7 @@ impl VdsServer {
         document_id: &DocumentId,
         parent: &SectionId,
     ) -> McpResult<Vec<TableOfContentsEntry>> {
-        let children = self.store.list_child_sections(document_id, Some(parent))?;
+        let children = self.store().list_child_sections(document_id, Some(parent))?;
         children
             .into_iter()
             .map(|section| {
@@ -234,7 +284,7 @@ impl VdsServer {
             Vec::new()
         } else {
             let next_depth = depth.map(|value| value.saturating_sub(1));
-            self.store
+            self.store()
                 .list_child_sections(document_id, Some(&section.section_id))?
                 .into_iter()
                 .map(|child| self.build_tree(document_id, child, next_depth))
@@ -246,7 +296,7 @@ impl VdsServer {
     fn touch_document(&self, document: &mut Document) -> McpResult<()> {
         document.current_version = VersionId::new_v7();
         document.updated_at = Utc::now();
-        self.store.put_document(document)?;
+        self.store().put_document(document)?;
         Ok(())
     }
 
@@ -293,8 +343,8 @@ impl VdsServer {
             author: opts.author.clone(),
             change_summary: opts.change_summary.clone(),
         };
-        self.store.put_section(section)?;
-        self.store.put_section_version(&version)?;
+        self.store().put_section(section)?;
+        self.store().put_section_version(&version)?;
         Ok(version)
     }
 
@@ -335,7 +385,7 @@ impl VdsServer {
     fn renumber_siblings(&self, siblings: &mut [Section]) -> McpResult<()> {
         for (index, sibling) in siblings.iter_mut().enumerate() {
             sibling.ordinal = index as u32;
-            self.store.put_section(sibling)?;
+            self.store().put_section(sibling)?;
         }
         Ok(())
     }
@@ -348,9 +398,7 @@ impl VdsServer {
         content: String,
         position: Option<InsertPosition>,
     ) -> McpResult<SectionInfo> {
-        let mut siblings = self
-            .store
-            .list_child_sections(&document.id, Some(&parent.section_id))?;
+        let mut siblings = self.store().list_child_sections(&document.id, Some(&parent.section_id))?;
         let index = self.ordered_insert_index(&siblings, position.as_ref())?;
         let now = Utc::now();
         let new_section_id = SectionId::new_v7();
@@ -382,7 +430,7 @@ impl VdsServer {
             .map(|sibling| sibling.section_id.clone())
             .collect();
         self.renumber_siblings(&mut siblings)?;
-        self.store.put_section(&parent)?;
+        self.store().put_section(&parent)?;
         let mut section = siblings
             .into_iter()
             .find(|sibling| sibling.section_id == new_section_id)
@@ -398,9 +446,7 @@ impl VdsServer {
         section: &Section,
     ) -> McpResult<Vec<SectionId>> {
         let mut ids = Vec::new();
-        for child in self
-            .store
-            .list_child_sections(document_id, Some(&section.section_id))?
+        for child in self.store().list_child_sections(document_id, Some(&section.section_id))?
         {
             ids.push(child.section_id.clone());
             ids.extend(self.descendant_ids(document_id, &child)?);
@@ -499,9 +545,9 @@ impl VdsServer {
     ) -> McpResult<()> {
         let level = (section.level as i16 + delta).clamp(1, 6) as u8;
         section.level = level;
-        self.store.put_section(section)?;
+        self.store().put_section(section)?;
         for mut child in self
-            .store
+            .store()
             .list_child_sections(document_id, Some(&section.section_id))?
         {
             self.apply_level_delta(document_id, &mut child, delta)?;
@@ -594,9 +640,7 @@ impl VdsServer {
 
 impl VdsMcpSurface for VdsServer {
     fn list_documents(&self, _params: ListDocumentsParams) -> McpResult<Vec<DocumentInfo>> {
-        Ok(self
-            .store
-            .list_documents()?
+        Ok(self.store().list_documents()?
             .into_iter()
             .map(Self::document_info)
             .collect())
@@ -610,27 +654,27 @@ impl VdsMcpSurface for VdsServer {
         } = params;
         let import_name = title.clone().unwrap_or_else(|| name.clone());
         let mut document = import_markdown_str(
-            &self.store,
+            &*self.store(),
             import_name,
             None,
             initial_content.as_deref().unwrap_or_default(),
         )?;
         document.name = name;
         document.metadata.title = title;
-        self.store.put_document(&document)?;
+        self.store().put_document(&document)?;
         Ok(Self::document_info(document))
     }
 
     fn import_document(&self, params: ImportDocumentParams) -> McpResult<DocumentInfo> {
         Ok(Self::document_info(import_markdown_file(
-            &self.store,
+            &*self.store(),
             params.name,
             params.path,
         )?))
     }
 
     fn export_document(&self, params: ExportDocumentParams) -> McpResult<ExportResult> {
-        let bytes_written = export_markdown_file(&self.store, &params.document_id, &params.path)?;
+        let bytes_written = export_markdown_file(&*self.store(), &params.document_id, &params.path)?;
         Ok(ExportResult {
             document_id: params.document_id,
             path: params.path,
@@ -643,7 +687,7 @@ impl VdsMcpSurface for VdsServer {
     }
 
     fn delete_document(&self, params: DeleteDocumentParams) -> McpResult<DeleteResult> {
-        let deleted = self.store.delete_document(&params.document_id)?;
+        let deleted = self.store().delete_document(&params.document_id)?;
         let (sections_deleted, versions_deleted, snapshots_deleted) = deleted.unwrap_or((0, 0, 0));
         Ok(DeleteResult {
             document_id: params.document_id,
@@ -658,7 +702,7 @@ impl VdsMcpSurface for VdsServer {
         let mut document = self.require_document(&params.document_id)?;
         document.name = params.name;
         document.updated_at = Utc::now();
-        self.store.put_document(&document)?;
+        self.store().put_document(&document)?;
         Ok(Self::document_info(document))
     }
 
@@ -689,7 +733,7 @@ impl VdsMcpSurface for VdsServer {
 
     fn render_section_markdown(&self, params: RenderSectionMarkdownParams) -> McpResult<String> {
         Ok(render_section_markdown_string(
-            &self.store,
+            &*self.store(),
             &params.document_id,
             &params.section_id,
             params.include_children,
@@ -697,7 +741,7 @@ impl VdsMcpSurface for VdsServer {
     }
 
     fn render_document_markdown(&self, params: RenderDocumentMarkdownParams) -> McpResult<String> {
-        Ok(export_markdown_string(&self.store, &params.document_id)?)
+        Ok(export_markdown_string(&*self.store(), &params.document_id)?)
     }
 
     fn create_section(&self, params: CreateSectionParams) -> McpResult<SectionInfo> {
@@ -877,9 +921,7 @@ impl VdsMcpSurface for VdsServer {
             ));
         }
         let mut old_parent = self.child_parent(&document, section.parent_id.clone())?;
-        let mut old_siblings = self
-            .store
-            .list_child_sections(&params.document_id, Some(&old_parent.section_id))?
+        let mut old_siblings = self.store().list_child_sections(&params.document_id, Some(&old_parent.section_id))?
             .into_iter()
             .filter(|sibling| sibling.section_id != section.section_id)
             .collect::<Vec<_>>();
@@ -888,11 +930,9 @@ impl VdsMcpSurface for VdsServer {
             .map(|sibling| sibling.section_id.clone())
             .collect();
         self.renumber_siblings(&mut old_siblings)?;
-        self.store.put_section(&old_parent)?;
+        self.store().put_section(&old_parent)?;
 
-        let mut new_siblings = self
-            .store
-            .list_child_sections(&params.document_id, Some(&new_parent.section_id))?
+        let mut new_siblings = self.store().list_child_sections(&params.document_id, Some(&new_parent.section_id))?
             .into_iter()
             .filter(|sibling| sibling.section_id != section.section_id)
             .collect::<Vec<_>>();
@@ -906,7 +946,7 @@ impl VdsMcpSurface for VdsServer {
             .map(|sibling| sibling.section_id.clone())
             .collect();
         self.renumber_siblings(&mut new_siblings)?;
-        self.store.put_section(&new_parent)?;
+        self.store().put_section(&new_parent)?;
         let delta = section.level as i16 - old_level as i16;
         self.apply_level_delta(&params.document_id, &mut section, delta)?;
         self.save_section_version(&mut section, &params.options)?;
@@ -931,9 +971,7 @@ impl VdsMcpSurface for VdsServer {
             ));
         }
         let mut parent = self.child_parent(&document, section.parent_id.clone())?;
-        let mut siblings = self
-            .store
-            .list_child_sections(&params.document_id, Some(&parent.section_id))?
+        let mut siblings = self.store().list_child_sections(&params.document_id, Some(&parent.section_id))?
             .into_iter()
             .filter(|sibling| sibling.section_id != section.section_id)
             .collect::<Vec<_>>();
@@ -942,12 +980,12 @@ impl VdsMcpSurface for VdsServer {
             .map(|sibling| sibling.section_id.clone())
             .collect();
         self.renumber_siblings(&mut siblings)?;
-        self.store.put_section(&parent)?;
+        self.store().put_section(&parent)?;
 
         let removed_children = self.descendant_ids(&params.document_id, &section)?;
         let mut to_remove = vec![section.section_id.clone()];
         to_remove.extend(removed_children.clone());
-        self.store.delete_sections(&to_remove)?;
+        self.store().delete_sections(&to_remove)?;
         self.touch_document(&mut document)?;
         Ok(RemovedSectionInfo {
             section_id: params.section_id,
@@ -959,9 +997,7 @@ impl VdsMcpSurface for VdsServer {
     fn reorder_sections(&self, params: ReorderSectionsParams) -> McpResult<Vec<SectionInfo>> {
         let mut document = self.require_document(&params.document_id)?;
         let mut parent = self.child_parent(&document, params.parent_id)?;
-        let mut current = self
-            .store
-            .list_child_sections(&params.document_id, Some(&parent.section_id))?;
+        let mut current = self.store().list_child_sections(&params.document_id, Some(&parent.section_id))?;
         let mut current_ids = current
             .iter()
             .map(|section| section.section_id.clone())
@@ -988,7 +1024,7 @@ impl VdsMcpSurface for VdsServer {
             .map(|section| section.section_id.clone())
             .collect();
         self.renumber_siblings(&mut reordered)?;
-        self.store.put_section(&parent)?;
+        self.store().put_section(&parent)?;
         self.touch_document(&mut document)?;
         Ok(reordered
             .into_iter()
@@ -1015,7 +1051,7 @@ impl VdsMcpSurface for VdsServer {
                 // Remove from current parent's children
                 let mut old_parent = parent.clone();
                 old_parent.children.retain(|id| id != &section.section_id);
-                self.store.put_section(&old_parent)?;
+                self.store().put_section(&old_parent)?;
 
                 // Add to grandparent's children (after the parent)
                 let mut grandparent = self.require_section(&params.document_id, &grandparent_id)?;
@@ -1027,7 +1063,7 @@ impl VdsMcpSurface for VdsServer {
                 grandparent
                     .children
                     .insert(parent_index + 1, section.section_id.clone());
-                self.store.put_section(&grandparent)?;
+                self.store().put_section(&grandparent)?;
 
                 // Update section's parent and level
                 section.parent_id = Some(grandparent_id.clone());
@@ -1037,15 +1073,11 @@ impl VdsMcpSurface for VdsServer {
                 self.apply_level_delta(&params.document_id, &mut section, -1)?;
 
                 // Renumber siblings in old parent
-                let mut old_siblings = self
-                    .store
-                    .list_child_sections(&params.document_id, Some(&parent_id))?;
+                let mut old_siblings = self.store().list_child_sections(&params.document_id, Some(&parent_id))?;
                 self.renumber_siblings(&mut old_siblings)?;
 
                 // Renumber siblings in grandparent
-                let mut new_siblings = self
-                    .store
-                    .list_child_sections(&params.document_id, Some(&grandparent_id))?;
+                let mut new_siblings = self.store().list_child_sections(&params.document_id, Some(&grandparent_id))?;
                 self.renumber_siblings(&mut new_siblings)?;
             } else {
                 // Parent is root, just decrease level without changing parent
@@ -1075,9 +1107,7 @@ impl VdsMcpSurface for VdsServer {
         // When demoting, we need to update parent-child relationships
         // The section should become a child of its previous sibling if one exists
         if let Some(parent_id) = section.parent_id.clone() {
-            let siblings = self
-                .store
-                .list_child_sections(&params.document_id, Some(&parent_id))?;
+            let siblings = self.store().list_child_sections(&params.document_id, Some(&parent_id))?;
 
             // Find the previous sibling (one with ordinal just before this section)
             if let Some(prev_sibling) = siblings
@@ -1091,11 +1121,11 @@ impl VdsMcpSurface for VdsServer {
 
                 // Remove from old parent's children
                 old_parent.children.retain(|id| id != &section.section_id);
-                self.store.put_section(&old_parent)?;
+                self.store().put_section(&old_parent)?;
 
                 // Add to new parent's children
                 prev_sibling.children.push(section.section_id.clone());
-                self.store.put_section(&prev_sibling)?;
+                self.store().put_section(&prev_sibling)?;
 
                 // Update section's parent and level
                 let old_level = section.level;
@@ -1105,19 +1135,15 @@ impl VdsMcpSurface for VdsServer {
                 // Calculate the actual level change and apply to descendants
                 let level_delta = section.level as i16 - old_level as i16;
                 if level_delta != 0 {
-                    self.store.put_section(&section)?;
-                    for mut child in self
-                        .store
-                        .list_child_sections(&params.document_id, Some(&section.section_id))?
+                    self.store().put_section(&section)?;
+                    for mut child in self.store().list_child_sections(&params.document_id, Some(&section.section_id))?
                     {
                         self.apply_level_delta(&params.document_id, &mut child, level_delta)?;
                     }
                 }
 
                 // Renumber siblings in old parent
-                let mut remaining_siblings = self
-                    .store
-                    .list_child_sections(&params.document_id, Some(&parent_id))?;
+                let mut remaining_siblings = self.store().list_child_sections(&params.document_id, Some(&parent_id))?;
                 self.renumber_siblings(&mut remaining_siblings)?;
             } else {
                 // No previous sibling, just increase level without changing parent
@@ -1138,9 +1164,7 @@ impl VdsMcpSurface for VdsServer {
         params: SectionVersionsParams,
     ) -> McpResult<Vec<SectionVersionInfo>> {
         self.require_section(&params.document_id, &params.section_id)?;
-        Ok(self
-            .store
-            .list_section_versions(&params.section_id)?
+        Ok(self.store().list_section_versions(&params.section_id)?
             .into_iter()
             .map(|version| SectionVersionInfo {
                 version_id: version.version_id,
@@ -1154,9 +1178,7 @@ impl VdsMcpSurface for VdsServer {
 
     fn get_section_version(&self, params: GetSectionVersionParams) -> McpResult<SectionVersion> {
         self.require_section(&params.document_id, &params.section_id)?;
-        let version = self
-            .store
-            .get_section_version(&params.version_id)?
+        let version = self.store().get_section_version(&params.version_id)?
             .ok_or_else(|| {
                 mcp_error(
                     McpErrorCode::NotFound,
@@ -1219,13 +1241,13 @@ impl VdsMcpSurface for VdsServer {
             snapshot_id: crate::document::SnapshotId::new_v7(),
             document_id: params.document_id.clone(),
             root_version: document.current_version,
-            sections: self.store.list_document_sections(&params.document_id)?,
+            sections: self.store().list_document_sections(&params.document_id)?,
             label: params.label,
             created_at: Utc::now(),
             author: None,
             change_summary: params.change_summary,
         };
-        self.store.put_snapshot(&snapshot)?;
+        self.store().put_snapshot(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -1234,9 +1256,7 @@ impl VdsMcpSurface for VdsServer {
         params: DocumentSnapshotsParams,
     ) -> McpResult<Vec<DocumentSnapshotInfo>> {
         self.require_document(&params.document_id)?;
-        Ok(self
-            .store
-            .list_document_snapshots(&params.document_id)?
+        Ok(self.store().list_document_snapshots(&params.document_id)?
             .into_iter()
             .map(|snapshot| DocumentSnapshotInfo {
                 snapshot_id: snapshot.snapshot_id,
@@ -1254,9 +1274,7 @@ impl VdsMcpSurface for VdsServer {
         params: RestoreDocumentSnapshotParams,
     ) -> McpResult<DocumentInfo> {
         let mut document = self.require_document(&params.document_id)?;
-        let snapshot = self
-            .store
-            .get_snapshot(&params.snapshot_id)?
+        let snapshot = self.store().get_snapshot(&params.snapshot_id)?
             .ok_or_else(|| mcp_error(McpErrorCode::NotFound, "document snapshot not found"))?;
         if snapshot.document_id != params.document_id {
             return Err(mcp_error(
@@ -1270,19 +1288,17 @@ impl VdsMcpSurface for VdsServer {
                 "snapshot does not contain captured sections",
             ));
         }
-        let current_ids = self
-            .store
-            .list_document_sections(&params.document_id)?
+        let current_ids = self.store().list_document_sections(&params.document_id)?
             .into_iter()
             .map(|section| section.section_id)
             .collect::<Vec<_>>();
-        self.store.delete_sections(&current_ids)?;
+        self.store().delete_sections(&current_ids)?;
         for section in &snapshot.sections {
-            self.store.put_section(section)?;
+            self.store().put_section(section)?;
         }
         document.current_version = snapshot.root_version;
         document.updated_at = Utc::now();
-        self.store.put_document(&document)?;
+        self.store().put_document(&document)?;
         Ok(Self::document_info(document))
     }
 
@@ -1291,13 +1307,9 @@ impl VdsMcpSurface for VdsServer {
         params: DiffDocumentSnapshotsParams,
     ) -> McpResult<DiffResult> {
         self.require_document(&params.document_id)?;
-        let from = self
-            .store
-            .get_snapshot(&params.from_snapshot)?
+        let from = self.store().get_snapshot(&params.from_snapshot)?
             .ok_or_else(|| mcp_error(McpErrorCode::NotFound, "from snapshot not found"))?;
-        let to = self
-            .store
-            .get_snapshot(&params.to_snapshot)?
+        let to = self.store().get_snapshot(&params.to_snapshot)?
             .ok_or_else(|| mcp_error(McpErrorCode::NotFound, "to snapshot not found"))?;
         if from.document_id != params.document_id || to.document_id != params.document_id {
             return Err(mcp_error(
@@ -1320,9 +1332,7 @@ impl VdsMcpSurface for VdsServer {
         let include_content = options.include_content;
         let include_titles = options.include_titles;
         let max_results = options.max_results.unwrap_or(50).max(1) as usize;
-        let mut results = self
-            .store
-            .list_document_sections(&params.document_id)?
+        let mut results = self.store().list_document_sections(&params.document_id)?
             .into_iter()
             .filter_map(|section| {
                 let title = section.title.to_lowercase();
@@ -1384,7 +1394,7 @@ impl VdsMcpSurface for VdsServer {
         );
         let mut sections_by_node = Vec::new();
 
-        for section in self.store.list_document_sections(&params.document_id)? {
+        for section in self.store().list_document_sections(&params.document_id)? {
             let Some(embedding) = &section.embedding else {
                 continue;
             };
@@ -1427,9 +1437,7 @@ impl VdsMcpSurface for VdsServer {
 
     fn find_by_title(&self, params: FindByTitleParams) -> McpResult<Vec<SectionSearchResult>> {
         let query = params.title.to_lowercase();
-        Ok(self
-            .store
-            .list_document_sections(&params.document_id)?
+        Ok(self.store().list_document_sections(&params.document_id)?
             .into_iter()
             .filter_map(|section| {
                 let title = section.title.to_lowercase();
@@ -1449,9 +1457,7 @@ impl VdsMcpSurface for VdsServer {
     }
 
     fn find_by_tag(&self, params: FindByTagParams) -> McpResult<Vec<SectionInfo>> {
-        Ok(self
-            .store
-            .list_document_sections(&params.document_id)?
+        Ok(self.store().list_document_sections(&params.document_id)?
             .into_iter()
             .filter(|section| section.metadata.tags.iter().any(|tag| tag == &params.tag))
             .map(|section| self.section_info(section))
@@ -1461,8 +1467,8 @@ impl VdsMcpSurface for VdsServer {
     fn list_recent_changes(&self, params: ListRecentChangesParams) -> McpResult<Vec<ChangeRecord>> {
         self.require_document(&params.document_id)?;
         let mut changes = Vec::new();
-        for section in self.store.list_document_sections(&params.document_id)? {
-            for version in self.store.list_section_versions(&section.section_id)? {
+        for section in self.store().list_document_sections(&params.document_id)? {
+            for version in self.store().list_section_versions(&section.section_id)? {
                 changes.push(ChangeRecord {
                     revision_id: version.version_id.as_str().to_owned(),
                     document_id: params.document_id.clone(),
@@ -1476,7 +1482,7 @@ impl VdsMcpSurface for VdsServer {
                 });
             }
         }
-        for snapshot in self.store.list_document_snapshots(&params.document_id)? {
+        for snapshot in self.store().list_document_snapshots(&params.document_id)? {
             changes.push(ChangeRecord {
                 revision_id: snapshot.snapshot_id.as_str().to_owned(),
                 document_id: params.document_id.clone(),
@@ -1529,7 +1535,7 @@ impl VdsMcpSurface for VdsServer {
         }
         section.metadata.locked = true;
         section.updated_at = Utc::now();
-        self.store.put_section(&section)?;
+        self.store().put_section(&section)?;
         Ok(LockInfo {
             document_id: params.document_id,
             section_id: params.section_id,
@@ -1545,7 +1551,7 @@ impl VdsMcpSurface for VdsServer {
         let unlocked = section.metadata.locked;
         section.metadata.locked = false;
         section.updated_at = Utc::now();
-        self.store.put_section(&section)?;
+        self.store().put_section(&section)?;
         Ok(UnlockResult {
             document_id: params.document_id,
             section_id: params.section_id,
@@ -1561,6 +1567,46 @@ impl VdsMcpSurface for VdsServer {
             expected_version: params.expected_version.clone(),
             current_version: section.current_version.clone(),
             conflicted: params.expected_version != section.current_version,
+        })
+    }
+
+    fn set_workspace(&self, params: SetWorkspaceParams) -> McpResult<WorkspaceInfo> {
+        let workspace_path = PathBuf::from(&params.workspace);
+        self.set_workspace_path(workspace_path).map_err(|e| {
+            mcp_error(McpErrorCode::Internal, format!("Failed to set workspace: {}", e))
+        })?;
+        
+        let database = self.get_database_path();
+        Ok(WorkspaceInfo {
+            workspace: self.get_workspace_path().map(|p| p.to_string_lossy().into_owned()),
+            database: database.to_string_lossy().into_owned(),
+        })
+    }
+
+    fn get_workspace(&self, _params: GetWorkspaceParams) -> McpResult<WorkspaceInfo> {
+        let database = self.get_database_path();
+        Ok(WorkspaceInfo {
+            workspace: self.get_workspace_path().map(|p| p.to_string_lossy().into_owned()),
+            database: database.to_string_lossy().into_owned(),
+        })
+    }
+
+    fn set_database(&self, params: SetDatabaseParams) -> McpResult<DatabaseInfo> {
+        let database_path = PathBuf::from(&params.database);
+        self.reopen_database(database_path).map_err(|e| {
+            mcp_error(McpErrorCode::Internal, format!("Failed to set database: {}", e))
+        })?;
+        
+        let database = self.get_database_path();
+        Ok(DatabaseInfo {
+            database: database.to_string_lossy().into_owned(),
+        })
+    }
+
+    fn get_database(&self, _params: GetDatabaseParams) -> McpResult<DatabaseInfo> {
+        let database = self.get_database_path();
+        Ok(DatabaseInfo {
+            database: database.to_string_lossy().into_owned(),
         })
     }
 }
@@ -2098,6 +2144,19 @@ fn tool_schema(tool: VdsTool) -> Value {
             ],
             vec![],
         ),
+        VdsTool::SetWorkspace => object_schema(
+            vec![string_prop(
+                "workspace",
+                "Workspace directory path. Database will be at <workspace>/.vds/vds.db",
+            )],
+            vec![],
+        ),
+        VdsTool::GetWorkspace => object_schema(vec![], vec![]),
+        VdsTool::SetDatabase => object_schema(
+            vec![string_prop("database", "Database file path.")],
+            vec![],
+        ),
+        VdsTool::GetDatabase => object_schema(vec![], vec![]),
     }
 }
 

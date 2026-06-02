@@ -158,6 +158,15 @@ pub trait VdsMcpSurface {
     fn unlock_section(&self, params: UnlockSectionParams) -> McpResult<UnlockResult>;
     /// Checks whether an expected version still matches the current section.
     fn check_conflicts(&self, params: CheckConflictsParams) -> McpResult<ConflictCheckResult>;
+
+    /// Sets the workspace directory and uses <workspace>/.vds/vds.db as the database path.
+    fn set_workspace(&self, params: SetWorkspaceParams) -> McpResult<WorkspaceInfo>;
+    /// Gets the current workspace directory if the database is in a .vds folder.
+    fn get_workspace(&self, params: GetWorkspaceParams) -> McpResult<WorkspaceInfo>;
+    /// Sets an explicit database file path.
+    fn set_database(&self, params: SetDatabaseParams) -> McpResult<DatabaseInfo>;
+    /// Gets the current database file path.
+    fn get_database(&self, params: GetDatabaseParams) -> McpResult<DatabaseInfo>;
 }
 
 /// Stable command names exposed as MCP tools.
@@ -257,6 +266,14 @@ pub enum VdsTool {
     UnlockSection,
     /// Tool for [`VdsMcpSurface::check_conflicts`].
     CheckConflicts,
+    /// Tool for [`VdsMcpSurface::set_workspace`].
+    SetWorkspace,
+    /// Tool for [`VdsMcpSurface::get_workspace`].
+    GetWorkspace,
+    /// Tool for [`VdsMcpSurface::set_database`].
+    SetDatabase,
+    /// Tool for [`VdsMcpSurface::get_database`].
+    GetDatabase,
 }
 
 impl VdsTool {
@@ -359,6 +376,10 @@ impl VdsTool {
         Self::LockSection,
         Self::UnlockSection,
         Self::CheckConflicts,
+        Self::SetWorkspace,
+        Self::GetWorkspace,
+        Self::SetDatabase,
+        Self::GetDatabase,
     ];
 
     /// Returns the stable MCP tool name.
@@ -411,6 +432,10 @@ impl VdsTool {
             Self::LockSection => "lock_section",
             Self::UnlockSection => "unlock_section",
             Self::CheckConflicts => "check_conflicts",
+            Self::SetWorkspace => "set_workspace",
+            Self::GetWorkspace => "get_workspace",
+            Self::SetDatabase => "set_database",
+            Self::GetDatabase => "get_database",
         }
     }
 
@@ -647,6 +672,26 @@ impl VdsTool {
                 "Check conflicts",
                 "Compares an expected section version with the current stored version.",
                 "Use before writing if you need an explicit stale-context check separate from an edit command.",
+            ),
+            Self::SetWorkspace => (
+                "Set workspace",
+                "Sets the workspace directory and uses <workspace>/.vds/vds.db as the database path.",
+                "Use this when the MCP server starts in a different directory than your project. The database will be reopened at the new location.",
+            ),
+            Self::GetWorkspace => (
+                "Get workspace",
+                "Gets the current workspace directory if the database is in a .vds folder.",
+                "Use this to verify the current workspace configuration.",
+            ),
+            Self::SetDatabase => (
+                "Set database",
+                "Sets an explicit database file path, overriding the default .vds/vds.db location.",
+                "Use this for custom database locations. The database will be reopened at the new path.",
+            ),
+            Self::GetDatabase => (
+                "Get database",
+                "Gets the current database file path.",
+                "Use this to verify which database file is currently in use.",
             ),
         };
 
@@ -1223,6 +1268,44 @@ pub struct CheckConflictsParams {
     pub section_id: SectionId,
     /// Version the caller expects to still be current.
     pub expected_version: VersionId,
+}
+
+/// Parameters for setting the workspace directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetWorkspaceParams {
+    /// Workspace directory path.
+    pub workspace: String,
+}
+
+/// Parameters for getting the workspace directory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GetWorkspaceParams {}
+
+/// Parameters for setting the database file path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetDatabaseParams {
+    /// Database file path.
+    pub database: String,
+}
+
+/// Parameters for getting the database file path.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GetDatabaseParams {}
+
+/// Workspace information result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    /// Workspace directory path, if set and database is in .vds folder.
+    pub workspace: Option<String>,
+    /// Current database file path.
+    pub database: String,
+}
+
+/// Database information result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DatabaseInfo {
+    /// Current database file path.
+    pub database: String,
 }
 
 /// Lightweight document summary returned by lifecycle commands.

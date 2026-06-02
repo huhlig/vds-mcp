@@ -65,6 +65,12 @@ VDS-MCP is a Model Context Protocol (MCP) server for managing Markdown documents
 - `unlock_section`: Allow edits to a locked section
 - `check_conflicts`: Verify version expectations
 
+#### Workspace & Database Management
+- `set_workspace`: Set the workspace directory (database will be at `<workspace>/.vds/vds.db`)
+- `get_workspace`: Get the current workspace directory and database path
+- `set_database`: Set an explicit database file path
+- `get_database`: Get the current database file path
+
 ### Usage Tips
 
 1. **Options are Optional**: Most operations accept optional `EditOptions` with fields for `expected_version`, `author`, and `change_summary`. When omitted, sensible defaults are used.
@@ -105,4 +111,17 @@ vds-mcp export <document-id>
 
 ### Database Location
 
-By default, VDS stores data in `.vds/vds.db`. Override with `--database` flag.
+By default, VDS stores data in `.vds/vds.db` relative to the current working directory. You can override this in several ways:
+
+1. **CLI Flag**: Use `--database <path>` to specify an explicit database file path
+2. **Workspace Flag**: Use `--workspace <path>` to use `<workspace>/.vds/vds.db`
+3. **MCP Tools**: Use `set_workspace` or `set_database` tools to change the database location at runtime
+
+**Important**: When Claude Desktop starts the MCP server, it runs in Claude's data directory, not your project directory. Use the `set_workspace` tool to point VDS to your project:
+
+```javascript
+// In your MCP client or at runtime:
+set_workspace({ workspace: "/path/to/your/project" })
+```
+
+This will reopen the database at `/path/to/your/project/.vds/vds.db`, allowing you to work with project-specific documents.

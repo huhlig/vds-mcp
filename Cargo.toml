@@ -1,6 +1,6 @@
 [package]
 name = "vds-mcp"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 authors = ["Hans W. Uhlig"]
 description = "Versioned Document Service MCP server for managing Markdown as stable, versioned section trees."
