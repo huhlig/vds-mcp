@@ -56,7 +56,8 @@ fn overview_server(name: &str) -> (VdsServer, vds::mcp::DocumentInfo) {
     let server = VdsServer::open(test_db_path(name)).unwrap();
     let document = server
         .create_document(CreateDocumentParams {
-            name: "overview".to_owned(),
+            relative_path: None,
+            name: Some("overview".to_owned()),
             title: None,
             initial_content: Some(OVERVIEW.to_owned()),
         })
@@ -94,29 +95,29 @@ fn creates_overview_document_and_navigates_section_tree() {
             document_id: document.id.clone(),
         })
         .unwrap();
-    let architecture_id = first_titled_section(&toc, "Basic Architecture").unwrap();
+    let index_id = first_titled_section(&toc, "In-Memory Index").unwrap();
 
-    let architecture = server
+    let index_section = server
         .get_section(GetSectionParams {
             document_id: document.id.clone(),
-            section_id: architecture_id.clone(),
+            section_id: index_id.clone(),
         })
         .unwrap();
-    assert_eq!(architecture.title, "Basic Architecture");
-    assert!(!architecture.children.is_empty());
+    assert_eq!(index_section.title, "In-Memory Index");
+    assert!(!index_section.children.is_empty());
 
     let tree = server
         .get_section_tree(GetSectionTreeParams {
             document_id: document.id.clone(),
-            section_id: architecture_id,
+            section_id: index_id,
             depth: Some(1),
         })
         .unwrap();
-    assert_eq!(tree.section.title, "Basic Architecture");
+    assert_eq!(tree.section.title, "In-Memory Index");
     assert!(
         tree.children
             .iter()
-            .any(|child| child.section.title == "CLI Layer")
+            .any(|child| child.section.title == "Full-Text Search")
     );
 }
 
@@ -128,25 +129,25 @@ fn renders_searches_versions_and_checks_conflicts_for_overview() {
             document_id: document.id.clone(),
         })
         .unwrap();
-    let storage_id = first_titled_section(&toc, "Storage Layer").unwrap();
+    let search_section_id = first_titled_section(&toc, "Full-Text Search").unwrap();
 
     let rendered_section = server
         .render_section_markdown(RenderSectionMarkdownParams {
             document_id: document.id.clone(),
-            section_id: storage_id.clone(),
+            section_id: search_section_id.clone(),
             include_children: false,
         })
         .unwrap();
-    assert!(rendered_section.starts_with("### Storage Layer"));
-    assert!(rendered_section.contains("redb"));
+    assert!(rendered_section.starts_with("### Full-Text Search"));
+    assert!(rendered_section.contains("BM25"));
 
     let rendered_document = server
         .render_document_markdown(RenderDocumentMarkdownParams {
             document_id: document.id.clone(),
         })
         .unwrap();
-    assert!(rendered_document.contains("# Versioned Document Service Overview"));
-    assert!(rendered_document.contains("## Data Flow"));
+    assert!(rendered_document.contains("# Versioned Document Service"));
+    assert!(rendered_document.contains("## Mutation Durability"));
 
     let search_results = server
         .search_sections(SearchSectionsParams {
@@ -165,7 +166,7 @@ fn renders_searches_versions_and_checks_conflicts_for_overview() {
     let title_results = server
         .find_by_title(FindByTitleParams {
             document_id: document.id.clone(),
-            title: "Storage Layer".to_owned(),
+            title: "Full-Text Search".to_owned(),
             fuzzy: false,
         })
         .unwrap();
@@ -174,7 +175,7 @@ fn renders_searches_versions_and_checks_conflicts_for_overview() {
     let versions = server
         .section_versions(SectionVersionsParams {
             document_id: document.id.clone(),
-            section_id: storage_id.clone(),
+            section_id: search_section_id.clone(),
         })
         .unwrap();
     assert_eq!(versions.len(), 1);
@@ -183,7 +184,7 @@ fn renders_searches_versions_and_checks_conflicts_for_overview() {
     let clean_conflict_check = server
         .check_conflicts(CheckConflictsParams {
             document_id: document.id.clone(),
-            section_id: storage_id.clone(),
+            section_id: search_section_id.clone(),
             expected_version: current,
         })
         .unwrap();
@@ -192,7 +193,7 @@ fn renders_searches_versions_and_checks_conflicts_for_overview() {
     let stale_conflict_check = server
         .check_conflicts(CheckConflictsParams {
             document_id: document.id,
-            section_id: storage_id,
+            section_id: search_section_id,
             expected_version: VersionId::new("ver-stale"),
         })
         .unwrap();
@@ -223,8 +224,8 @@ fn imports_and_exports_overview_file_through_service() {
     let exported = fs::read_to_string(&output).unwrap();
 
     assert_eq!(export.bytes_written as usize, exported.len());
-    assert!(exported.contains("# Versioned Document Service Overview"));
-    assert!(exported.contains("## Basic Architecture"));
+    assert!(exported.contains("# Versioned Document Service"));
+    assert!(exported.contains("## Mutation Durability"));
 }
 
 #[test]
@@ -266,7 +267,8 @@ fn editing_history_locking_and_deletion_are_storage_backed() {
     let server = VdsServer::open(test_db_path("editing")).unwrap();
     let document = server
         .create_document(CreateDocumentParams {
-            name: "editing".to_owned(),
+            relative_path: None,
+            name: Some("editing".to_owned()),
             title: None,
             initial_content: Some("# Guide\n\nStart\n".to_owned()),
         })
@@ -459,7 +461,8 @@ fn mcp_json_request_compatibility_accepts_agent_friendly_shapes() {
     let server = VdsServer::open(test_db_path("compat")).unwrap();
     let document = server
         .create_document(CreateDocumentParams {
-            name: "compat".to_owned(),
+            relative_path: None,
+            name: Some("compat".to_owned()),
             title: None,
             initial_content: Some("# Guide\n\nStart\n".to_owned()),
         })
@@ -531,7 +534,8 @@ fn search_sections_matches_multi_term_queries_and_honors_limit_alias() {
     let server = VdsServer::open(test_db_path("multi-term-search")).unwrap();
     let document = server
         .create_document(CreateDocumentParams {
-            name: "search".to_owned(),
+            relative_path: None,
+            name: Some("search".to_owned()),
             title: None,
             initial_content: Some(
                 "# Guide\n\nSnapshots capture document-wide points in time, while versions make rollback possible.\n"

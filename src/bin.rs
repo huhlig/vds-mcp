@@ -46,8 +46,17 @@ struct Cli {
 enum Command {
     /// Start the MCP server over stdio.
     Serve,
-    /// Start the MCP server over streamable HTTP.
+    /// Start the filesystem-authoritative VDS 2 server over stdio.
+    ServeV2,
+    /// Start the MCP server over streamable HTTP (legacy VDS 1 database mode).
     Server {
+        #[arg(long, default_value = "127.0.0.1:8001")]
+        bind: String,
+        #[arg(long, default_value = "/mcp")]
+        path: String,
+    },
+    /// Start the filesystem-authoritative VDS 2 server over streamable HTTP.
+    ServerV2 {
         #[arg(long, default_value = "127.0.0.1:8001")]
         bind: String,
         #[arg(long, default_value = "/mcp")]
@@ -75,18 +84,27 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    
+
     // Determine the database path: use workspace if provided, otherwise use database flag
-    let database = if let Some(workspace) = cli.workspace {
+    let workspace = cli.workspace.clone();
+    let database = if let Some(workspace) = &cli.workspace {
         workspace.join(".vds").join("vds.db")
     } else {
         cli.database
     };
-    
+
     match cli.command {
         Command::Serve => vds::service::serve_stdio(database).await?,
+        Command::ServeV2 => {
+            let workspace = workspace.unwrap_or(std::env::current_dir()?);
+            vds::filesystem_service::serve_filesystem_stdio(workspace).await?
+        }
         Command::Server { bind, path } => {
             vds::service::serve_streamable_http(database, bind, path).await?
+        }
+        Command::ServerV2 { bind, path } => {
+            let workspace = workspace.unwrap_or(std::env::current_dir()?);
+            vds::filesystem_service::serve_filesystem_http(workspace, bind, path).await?
         }
         Command::List => {
             let server = VdsServer::open(database)?;
@@ -148,127 +166,101 @@ fn onboard_agent() -> Result<(), Box<dyn Error>> {
 
 VDS-MCP is a Model Context Protocol (MCP) server for managing Markdown documents as stable, versioned section trees.
 
-### Key Features
+**VDS 2.0** is production-ready and filesystem-authoritative: your Markdown files are the source of truth, and VDS
+metadata (`.vds/`) stores stable IDs, version history, and snapshots as Git-friendly JSON files.
 
-- **Hierarchical Document Structure**: Documents are organized as trees of sections with automatic heading level management
-- **Version Control**: Every section edit creates a new version with optional author and change summary metadata
-- **Snapshots**: Create named snapshots of entire document states for rollback or comparison
-- **Search**: Full-text search across section titles and content, with optional semantic search using embeddings
-- **Conflict Detection**: Optimistic concurrency control prevents conflicting edits
+### Starting the Server
 
-### Common MCP Operations
+```json
+{
+  "mcpServers": {
+    "vds": {
+      "command": "vds-mcp",
+      "args": ["--workspace", "/absolute/path/to/project", "serve-v2"]
+    }
+  }
+}
+```
+
+Use `serve-v2` (VDS 2.0 filesystem mode). `serve` is the legacy database-backed VDS 1 mode.
+
+### Key Operations
 
 #### Document Management
-- `list_documents`: List all documents in storage
-- `create_document`: Create a new document with optional initial content
-- `import_document`: Import a Markdown file from disk
-- `export_document`: Export a document to disk as Markdown
-- `get_document`: Get document metadata
-- `delete_document`: Delete a document and all its sections
-- `rename_document`: Change a document's name
+- `list_documents` — list all managed documents in the workspace
+- `get_document` — get document metadata and root section ID
+- `create_document` — create a new Markdown file and manage it
+- `manage_document_file` — adopt an existing Markdown file into VDS tracking
+- `get_document_location` — get the workspace-relative path of a document
+- `rename_document` — rename the document (file move + metadata update)
+- `import_document` — adopt an existing file by path
+- `export_document` — render a document back to a Markdown file
+- `remove_document_file` — soft-delete a document (archived, restorable)
+- `restore_document_file` — restore a soft-deleted document
+- `unmanage_document_file` — stop tracking a file without deleting it
 
 #### Section Operations
-- `get_section`: Retrieve a specific section
-- `get_section_tree`: Get a section and its descendants
-- `create_section`: Add a new section to a document
-- `update_section`: Replace section content
-- `patch_section`: Apply structured edits (append, rename, set metadata). Parameters require a top-level `patch` object containing `operations`.
-- `append_to_section`: Add content to the end of a section
-- `rename_section`: Change a section's title
-- `insert_section_before`: Insert a section before an existing sibling using `sibling_section_id`
-- `insert_section_after`: Insert a section after an existing sibling using `sibling_section_id`
-- `move_section`: Relocate a section in the document tree
-- `remove_section`: Delete a section (optionally with children)
-- `promote_section`: Decrease heading level (move up in hierarchy)
-- `demote_section`: Increase heading level (move down in hierarchy)
+- `get_section` — retrieve a section's title, content, level, and version
+- `get_section_tree` — get a section and all its descendants
+- `table_of_contents` — get a document's heading outline
+- `create_section` — add a new section (child of a parent, or sibling)
+- `update_section` — replace a section's content
+- `append_to_section` — add content to the end of a section
+- `rename_section` — change a section's heading title
+- `insert_section_before` / `insert_section_after` — insert relative to a sibling (use `sibling_section_id`)
+- `move_section` — relocate a section to a different parent
+- `reorder_sections` — reorder children under a parent (use `parent_id` and `ordered_children`)
+- `promote_section` / `demote_section` — change heading level
+- `remove_section` — remove a section; set `remove_children: true` to remove descendants too
+- `split_section` — split at a byte offset (`split_at` field, not `split_content`)
+- `set_section_metadata` — update anchor, tags, summary, or lock state
 
-#### Versioning
-- `section_versions`: List all versions of a section
-- `get_section_version`: Retrieve a historical version
-- `switch_section_version`: Revert to a previous version
-- `diff_section_versions`: Compare two versions
+#### Version History
+- `section_versions` — list all version IDs for a section
+- `get_section_version` — retrieve a historical version by version ID
+- `diff_section_versions` — compare two versions
+- `switch_section_version` — restore a section to a prior version
 
 #### Snapshots
-- `create_document_snapshot`: Save current document state
-- `document_snapshots`: List all snapshots
-- `restore_document_snapshot`: Revert to a snapshot
-- `diff_document_snapshots`: Compare two snapshots
+- `create_document_snapshot` — save the full document tree state with an optional label
+- `document_snapshots` — list all saved snapshots
+- `diff_document_snapshots` — compare two snapshots
+- `restore_document_snapshot` — revert the document to a snapshot state
 
-#### Search & Discovery
-- `search_sections`: Full-text search across sections
-- `semantic_search_sections`: Vector similarity search (requires semantic-search feature)
-- `find_by_title`: Find sections by title
-- `find_by_tag`: Find sections with specific metadata tags
-- `table_of_contents`: Generate document outline
+#### Search
+- `full_text_search` — BM25 lexical search across all section titles and content
+  - Supports `"quoted phrases"`, `prefix*` queries, AND/OR modes, and path filters
+  - camelCase/PascalCase identifiers are tokenized into sub-words automatically
+- `semantic_search_sections` — nearest-neighbor semantic search (requires `--features semantic-search` build)
+  - **Requires pre-computed embeddings** — pass embedding vector via `query_embedding` parameter
+  - VDS caches embeddings by (section_id, content_hash, model) but does not generate them
+  - Uses HNSW index for fast approximate nearest neighbors
+- `find_by_title` — exact or fuzzy title matching
+- `find_by_tag` — search by section metadata tags
 
-#### Maintenance
-- `validate_document`: Check document integrity
-- `normalize_document`: Fix structural issues
-- `repair_document`: Attempt to fix corrupted documents
-- `lock_section`: Prevent edits to a section
-- `unlock_section`: Allow edits to a locked section
-- `check_conflicts`: Verify version expectations
-
-#### Workspace & Database Management
-- `set_workspace`: Set the workspace directory (database will be at `<workspace>/.vds/vds.db`)
-- `get_workspace`: Get the current workspace directory and database path
-- `set_database`: Set an explicit database file path
-- `get_database`: Get the current database file path
+#### Workspace
+- `get_workspace` — current workspace path, watcher status, and reload count
+- `set_workspace` — switch to a different workspace at runtime
+- `validate_document` — check content hash, version files, and snapshot references
 
 ### Usage Tips
 
-1. **Options are Optional**: Most operations accept optional `EditOptions` with fields for `expected_version`, `author`, and `change_summary`. When omitted, sensible defaults are used.
+1. **Conflict detection**: Every mutation accepts an optional `expected_content_hash`. Supply the hash returned
+   by `get_document_location` or `get_section` to detect external edits before they are silently overwritten.
 
-2. **Search Options**: Search operations accept optional configuration:
-   - `SearchOptions`: Control content/title search, fuzzy matching, and result limits
-   - `SemanticSearchOptions`: Configure HNSW parameters for vector search
-   - `NormalizeOptions`: Control document normalization behavior
+2. **Safe edits**: Read the section first, note its `current_version`, then call the mutation tool. If another
+   agent or a human edited the file between read and write, VDS returns `ExternalContentConflict`.
 
-3. **Hierarchical Structure**: Sections maintain parent-child relationships. Moving or removing sections affects their descendants.
+3. **Structural vs. content mutations**: `update_section`, `append_to_section`, `rename_section`, and
+   `set_section_metadata` are surgical (fast, byte-range). `create_section`, `remove_section`, `reorder_sections`,
+   `move_section`, `promote_section`, `demote_section`, and `split_section` re-render the whole file canonically.
 
-4. **Version Safety**: Use `expected_version` in `EditOptions` for optimistic concurrency control to prevent conflicting edits.
+4. **remove_section**: The `remove_children` field is required. Pass `false` to detach children (they become
+   siblings of the removed section) or `true` to delete the section and all descendants.
 
-5. **Patch Shape**: Call `patch_section` with `patch.operations`, not a top-level `operations` field.
+5. **reorder_sections**: Use `parent_id` (not `parent_section_id`) and `ordered_children` (not `ordered_section_ids`).
 
-6. **Sibling Field Names**: Call `insert_section_before` and `insert_section_after` with `sibling_section_id`, not `sibling_id`.
-
-### Example User Workflow
-
-```bash
-# Create Agent Onboarding Instructions
-vds-mcp onboard
-
-# Import existing markdown
-vds-mcp import README.md --name "readme"
-
-# List all documents
-vds-mcp list
-
-# Export a document
-vds-mcp export <document-id>
-```
-
-### MCP Server Modes
-
-- **stdio**: `vds-mcp serve` - For local MCP clients
-- **HTTP**: `vds-mcp server --bind 127.0.0.1:8001 --path /mcp` - For remote access
-
-### Database Location
-
-By default, VDS stores data in `.vds/vds.db` relative to the current working directory. You can override this in several ways:
-
-1. **CLI Flag**: Use `--database <path>` to specify an explicit database file path
-2. **Workspace Flag**: Use `--workspace <path>` to use `<workspace>/.vds/vds.db`
-3. **MCP Tools**: Use `set_workspace` or `set_database` tools to change the database location at runtime
-
-**Important**: When Claude Desktop starts the MCP server, it runs in Claude's data directory, not your project directory. Use the `set_workspace` tool to point VDS to your project:
-
-```javascript
-// In your MCP client or at runtime:
-set_workspace({ workspace: "/path/to/your/project" })
-```
-
-This will reopen the database at `/path/to/your/project/.vds/vds.db`, allowing you to work with project-specific documents.
+6. **split_section**: Use `split_at` (byte offset into the section content) to control the split point.
 "#;
 
     let content = if agents_file.exists() {

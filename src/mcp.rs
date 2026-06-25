@@ -35,22 +35,83 @@ use crate::document::{
 /// Result type returned by MCP command handlers.
 pub type McpResult<T> = std::result::Result<T, McpError>;
 
+fn default_true() -> bool {
+    true
+}
+
+macro_rules! unsupported_surface_method {
+    ($name:ident, $params:ty, $result:ty) => {
+        fn $name(&self, _params: $params) -> McpResult<$result> {
+            Err(McpError {
+                code: McpErrorCode::InvalidInput,
+                message: format!(
+                    "{} is not available for this VDS service mode",
+                    stringify!($name)
+                ),
+            })
+        }
+    };
+}
+
 /// Transport-neutral interface covering the full VDS MCP command list.
+#[allow(unused_doc_comments)]
 pub trait VdsMcpSurface {
     /// Lists all documents available in the store.
     fn list_documents(&self, params: ListDocumentsParams) -> McpResult<Vec<DocumentInfo>>;
     /// Creates a new document, optionally seeded with initial Markdown content.
-    fn create_document(&self, params: CreateDocumentParams) -> McpResult<DocumentInfo>;
+    unsupported_surface_method!(create_document, CreateDocumentParams, DocumentInfo);
     /// Imports a Markdown file into the internal section tree model.
-    fn import_document(&self, params: ImportDocumentParams) -> McpResult<DocumentInfo>;
+    unsupported_surface_method!(import_document, ImportDocumentParams, DocumentInfo);
     /// Exports a document from the internal model to a Markdown file.
-    fn export_document(&self, params: ExportDocumentParams) -> McpResult<ExportResult>;
+    unsupported_surface_method!(export_document, ExportDocumentParams, ExportResult);
     /// Reads the complete document record.
     fn get_document(&self, params: GetDocumentParams) -> McpResult<Document>;
     /// Deletes a document and its associated tree, versions, and snapshots.
-    fn delete_document(&self, params: DeleteDocumentParams) -> McpResult<DeleteResult>;
+    unsupported_surface_method!(delete_document, DeleteDocumentParams, DeleteResult);
     /// Renames a document while preserving its stable document ID.
-    fn rename_document(&self, params: RenameDocumentParams) -> McpResult<DocumentInfo>;
+    unsupported_surface_method!(rename_document, RenameDocumentParams, DocumentInfo);
+    /// Returns the authoritative file location and content hash for a document.
+    unsupported_surface_method!(
+        get_document_location,
+        GetDocumentLocationParams,
+        DocumentLocation
+    );
+    /// Promotes a discovered Markdown file into durable VDS management.
+    unsupported_surface_method!(
+        manage_document_file,
+        ManageDocumentFileParams,
+        DocumentLocation
+    );
+    /// Moves a managed Markdown document to another workspace-relative path.
+    unsupported_surface_method!(
+        move_document_file,
+        MoveDocumentFileParams,
+        DocumentFileMutationResult
+    );
+    /// Renames a managed Markdown file without changing its parent folder.
+    unsupported_surface_method!(
+        rename_document_file,
+        RenameDocumentFileParams,
+        DocumentFileMutationResult
+    );
+    /// Soft-deletes a managed Markdown file and preserves recoverable history.
+    unsupported_surface_method!(
+        remove_document_file,
+        RemoveDocumentFileParams,
+        DocumentFileMutationResult
+    );
+    /// Stops managing a Markdown file while leaving the file in place.
+    unsupported_surface_method!(
+        unmanage_document_file,
+        UnmanageDocumentFileParams,
+        DocumentFileMutationResult
+    );
+    /// Restores a soft-deleted document from the inactive archive.
+    unsupported_surface_method!(
+        restore_document_file,
+        RestoreDocumentFileParams,
+        DocumentFileMutationResult
+    );
 
     /// Builds a recursive table of contents for a document.
     fn table_of_contents(
@@ -69,78 +130,106 @@ pub trait VdsMcpSurface {
     fn render_document_markdown(&self, params: RenderDocumentMarkdownParams) -> McpResult<String>;
 
     /// Creates a new section under a parent or at the document root.
-    fn create_section(&self, params: CreateSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(create_section, CreateSectionParams, SectionInfo);
     /// Inserts a section before an existing sibling.
-    fn insert_section_before(&self, params: InsertSectionBeforeParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(
+        insert_section_before,
+        InsertSectionBeforeParams,
+        SectionInfo
+    );
     /// Inserts a section after an existing sibling.
-    fn insert_section_after(&self, params: InsertSectionAfterParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(insert_section_after, InsertSectionAfterParams, SectionInfo);
     /// Splits an existing section into two sections at a content offset.
-    fn split_section(&self, params: SplitSectionParams) -> McpResult<SplitSectionResult>;
+    unsupported_surface_method!(split_section, SplitSectionParams, SplitSectionResult);
 
     /// Replaces a section body.
-    fn update_section(&self, params: UpdateSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(update_section, UpdateSectionParams, SectionInfo);
     /// Applies targeted patch operations to a section.
-    fn patch_section(&self, params: PatchSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(patch_section, PatchSectionParams, SectionInfo);
     /// Appends content to a section body.
-    fn append_to_section(&self, params: AppendToSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(append_to_section, AppendToSectionParams, SectionInfo);
     /// Renames a section heading.
-    fn rename_section(&self, params: RenameSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(rename_section, RenameSectionParams, SectionInfo);
     /// Replaces section metadata.
-    fn set_section_metadata(&self, params: SetSectionMetadataParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(set_section_metadata, SetSectionMetadataParams, SectionInfo);
 
     /// Moves a section to a new parent or sibling position.
-    fn move_section(&self, params: MoveSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(move_section, MoveSectionParams, SectionInfo);
     /// Removes a section, optionally including its descendants.
-    fn remove_section(&self, params: RemoveSectionParams) -> McpResult<RemovedSectionInfo>;
+    unsupported_surface_method!(remove_section, RemoveSectionParams, RemovedSectionInfo);
     /// Replaces the child ordering under a parent.
-    fn reorder_sections(&self, params: ReorderSectionsParams) -> McpResult<Vec<SectionInfo>>;
+    unsupported_surface_method!(reorder_sections, ReorderSectionsParams, Vec<SectionInfo>);
     /// Promotes a section one heading/tree level.
-    fn promote_section(&self, params: PromoteSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(promote_section, PromoteSectionParams, SectionInfo);
     /// Demotes a section one heading/tree level.
-    fn demote_section(&self, params: DemoteSectionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(demote_section, DemoteSectionParams, SectionInfo);
 
     /// Lists version summaries for a section.
-    fn section_versions(&self, params: SectionVersionsParams)
-    -> McpResult<Vec<SectionVersionInfo>>;
+    unsupported_surface_method!(
+        section_versions,
+        SectionVersionsParams,
+        Vec<SectionVersionInfo>
+    );
     /// Reads a historical section version.
-    fn get_section_version(&self, params: GetSectionVersionParams) -> McpResult<SectionVersion>;
+    unsupported_surface_method!(get_section_version, GetSectionVersionParams, SectionVersion);
     /// Makes a historical section version current.
-    fn switch_section_version(&self, params: SwitchSectionVersionParams) -> McpResult<SectionInfo>;
+    unsupported_surface_method!(
+        switch_section_version,
+        SwitchSectionVersionParams,
+        SectionInfo
+    );
     /// Diffs two versions of one section.
-    fn diff_section_versions(&self, params: DiffSectionVersionsParams) -> McpResult<DiffResult>;
+    unsupported_surface_method!(diff_section_versions, DiffSectionVersionsParams, DiffResult);
     /// Creates a document-level snapshot.
-    fn create_document_snapshot(
-        &self,
-        params: CreateDocumentSnapshotParams,
-    ) -> McpResult<DocumentSnapshot>;
+    unsupported_surface_method!(
+        create_document_snapshot,
+        CreateDocumentSnapshotParams,
+        DocumentSnapshot
+    );
     /// Lists document snapshot summaries.
-    fn document_snapshots(
-        &self,
-        params: DocumentSnapshotsParams,
-    ) -> McpResult<Vec<DocumentSnapshotInfo>>;
+    unsupported_surface_method!(
+        document_snapshots,
+        DocumentSnapshotsParams,
+        Vec<DocumentSnapshotInfo>
+    );
     /// Restores a document from a snapshot.
-    fn restore_document_snapshot(
-        &self,
-        params: RestoreDocumentSnapshotParams,
-    ) -> McpResult<DocumentInfo>;
+    unsupported_surface_method!(
+        restore_document_snapshot,
+        RestoreDocumentSnapshotParams,
+        DocumentInfo
+    );
     /// Diffs two document snapshots.
-    fn diff_document_snapshots(&self, params: DiffDocumentSnapshotsParams)
-    -> McpResult<DiffResult>;
+    unsupported_surface_method!(
+        diff_document_snapshots,
+        DiffDocumentSnapshotsParams,
+        DiffResult
+    );
 
     /// Searches section titles and/or content.
     fn search_sections(&self, params: SearchSectionsParams) -> McpResult<Vec<SectionSearchResult>>;
+    /// Searches current sections across the workspace using the lexical index.
+    unsupported_surface_method!(
+        full_text_search,
+        FullTextSearchParams,
+        Vec<FullTextSearchResult>
+    );
     /// Searches sections by semantic embedding nearest neighbors.
     #[cfg(feature = "semantic-search")]
-    fn semantic_search_sections(
-        &self,
-        params: SemanticSearchSectionsParams,
-    ) -> McpResult<Vec<SectionSearchResult>>;
+    unsupported_surface_method!(
+        semantic_search_sections,
+        SemanticSearchSectionsParams,
+        Vec<SectionSearchResult>
+    );
     /// Finds sections by title, optionally with fuzzy matching.
     fn find_by_title(&self, params: FindByTitleParams) -> McpResult<Vec<SectionSearchResult>>;
     /// Finds sections with a matching tag.
     fn find_by_tag(&self, params: FindByTagParams) -> McpResult<Vec<SectionInfo>>;
     /// Lists recent document or section changes.
-    fn list_recent_changes(&self, params: ListRecentChangesParams) -> McpResult<Vec<ChangeRecord>>;
+    unsupported_surface_method!(
+        list_recent_changes,
+        ListRecentChangesParams,
+        Vec<ChangeRecord>
+    );
 
     /// Validates document tree and content integrity.
     fn validate_document(
@@ -148,23 +237,23 @@ pub trait VdsMcpSurface {
         params: ValidateDocumentParams,
     ) -> McpResult<Vec<ValidationDiagnostic>>;
     /// Normalizes document structure or formatting according to options.
-    fn normalize_document(&self, params: NormalizeDocumentParams) -> McpResult<NormalizeResult>;
+    unsupported_surface_method!(normalize_document, NormalizeDocumentParams, NormalizeResult);
     /// Attempts to repair invalid document state.
-    fn repair_document(&self, params: RepairDocumentParams) -> McpResult<RepairResult>;
+    unsupported_surface_method!(repair_document, RepairDocumentParams, RepairResult);
 
     /// Acquires a cooperative edit lock for a section.
-    fn lock_section(&self, params: LockSectionParams) -> McpResult<LockInfo>;
+    unsupported_surface_method!(lock_section, LockSectionParams, LockInfo);
     /// Releases a cooperative edit lock for a section.
-    fn unlock_section(&self, params: UnlockSectionParams) -> McpResult<UnlockResult>;
+    unsupported_surface_method!(unlock_section, UnlockSectionParams, UnlockResult);
     /// Checks whether an expected version still matches the current section.
-    fn check_conflicts(&self, params: CheckConflictsParams) -> McpResult<ConflictCheckResult>;
+    unsupported_surface_method!(check_conflicts, CheckConflictsParams, ConflictCheckResult);
 
     /// Sets the workspace directory and uses <workspace>/.vds/vds.db as the database path.
-    fn set_workspace(&self, params: SetWorkspaceParams) -> McpResult<WorkspaceInfo>;
+    unsupported_surface_method!(set_workspace, SetWorkspaceParams, WorkspaceInfo);
     /// Gets the current workspace directory if the database is in a .vds folder.
     fn get_workspace(&self, params: GetWorkspaceParams) -> McpResult<WorkspaceInfo>;
     /// Sets an explicit database file path.
-    fn set_database(&self, params: SetDatabaseParams) -> McpResult<DatabaseInfo>;
+    unsupported_surface_method!(set_database, SetDatabaseParams, DatabaseInfo);
     /// Gets the current database file path.
     fn get_database(&self, params: GetDatabaseParams) -> McpResult<DatabaseInfo>;
 }
@@ -187,6 +276,20 @@ pub enum VdsTool {
     DeleteDocument,
     /// Tool for [`VdsMcpSurface::rename_document`].
     RenameDocument,
+    /// Tool for [`VdsMcpSurface::get_document_location`].
+    GetDocumentLocation,
+    /// Tool for [`VdsMcpSurface::manage_document_file`].
+    ManageDocumentFile,
+    /// Tool for [`VdsMcpSurface::move_document_file`].
+    MoveDocumentFile,
+    /// Tool for [`VdsMcpSurface::rename_document_file`].
+    RenameDocumentFile,
+    /// Tool for [`VdsMcpSurface::remove_document_file`].
+    RemoveDocumentFile,
+    /// Tool for [`VdsMcpSurface::unmanage_document_file`].
+    UnmanageDocumentFile,
+    /// Tool for [`VdsMcpSurface::restore_document_file`].
+    RestoreDocumentFile,
     /// Tool for [`VdsMcpSurface::table_of_contents`].
     TableOfContents,
     /// Tool for [`VdsMcpSurface::get_section`].
@@ -245,6 +348,8 @@ pub enum VdsTool {
     DiffDocumentSnapshots,
     /// Tool for [`VdsMcpSurface::search_sections`].
     SearchSections,
+    /// Tool for [`VdsMcpSurface::full_text_search`].
+    FullTextSearch,
     /// Tool for [`VdsMcpSurface::semantic_search_sections`].
     #[cfg(feature = "semantic-search")]
     SemanticSearchSections,
@@ -279,7 +384,7 @@ pub enum VdsTool {
 impl VdsTool {
     /// Every VDS tool in the order it should usually be presented to clients.
     #[cfg(not(feature = "semantic-search"))]
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 57] = [
         Self::ListDocuments,
         Self::CreateDocument,
         Self::ImportDocument,
@@ -287,6 +392,13 @@ impl VdsTool {
         Self::GetDocument,
         Self::DeleteDocument,
         Self::RenameDocument,
+        Self::GetDocumentLocation,
+        Self::ManageDocumentFile,
+        Self::MoveDocumentFile,
+        Self::RenameDocumentFile,
+        Self::RemoveDocumentFile,
+        Self::UnmanageDocumentFile,
+        Self::RestoreDocumentFile,
         Self::TableOfContents,
         Self::GetSection,
         Self::GetSectionTree,
@@ -316,6 +428,7 @@ impl VdsTool {
         Self::RestoreDocumentSnapshot,
         Self::DiffDocumentSnapshots,
         Self::SearchSections,
+        Self::FullTextSearch,
         Self::FindByTitle,
         Self::FindByTag,
         Self::ListRecentChanges,
@@ -325,11 +438,15 @@ impl VdsTool {
         Self::LockSection,
         Self::UnlockSection,
         Self::CheckConflicts,
+        Self::SetWorkspace,
+        Self::GetWorkspace,
+        Self::SetDatabase,
+        Self::GetDatabase,
     ];
 
     /// Every VDS tool in the order it should usually be presented to clients.
     #[cfg(feature = "semantic-search")]
-    pub const ALL: [Self; 46] = [
+    pub const ALL: [Self; 58] = [
         Self::ListDocuments,
         Self::CreateDocument,
         Self::ImportDocument,
@@ -337,6 +454,13 @@ impl VdsTool {
         Self::GetDocument,
         Self::DeleteDocument,
         Self::RenameDocument,
+        Self::GetDocumentLocation,
+        Self::ManageDocumentFile,
+        Self::MoveDocumentFile,
+        Self::RenameDocumentFile,
+        Self::RemoveDocumentFile,
+        Self::UnmanageDocumentFile,
+        Self::RestoreDocumentFile,
         Self::TableOfContents,
         Self::GetSection,
         Self::GetSectionTree,
@@ -366,6 +490,7 @@ impl VdsTool {
         Self::RestoreDocumentSnapshot,
         Self::DiffDocumentSnapshots,
         Self::SearchSections,
+        Self::FullTextSearch,
         Self::SemanticSearchSections,
         Self::FindByTitle,
         Self::FindByTag,
@@ -392,6 +517,13 @@ impl VdsTool {
             Self::GetDocument => "get_document",
             Self::DeleteDocument => "delete_document",
             Self::RenameDocument => "rename_document",
+            Self::GetDocumentLocation => "get_document_location",
+            Self::ManageDocumentFile => "manage_document_file",
+            Self::MoveDocumentFile => "move_document_file",
+            Self::RenameDocumentFile => "rename_document_file",
+            Self::RemoveDocumentFile => "remove_document_file",
+            Self::UnmanageDocumentFile => "unmanage_document_file",
+            Self::RestoreDocumentFile => "restore_document_file",
             Self::TableOfContents => "table_of_contents",
             Self::GetSection => "get_section",
             Self::GetSectionTree => "get_section_tree",
@@ -421,6 +553,7 @@ impl VdsTool {
             Self::RestoreDocumentSnapshot => "restore_document_snapshot",
             Self::DiffDocumentSnapshots => "diff_document_snapshots",
             Self::SearchSections => "search_sections",
+            Self::FullTextSearch => "full_text_search",
             #[cfg(feature = "semantic-search")]
             Self::SemanticSearchSections => "semantic_search_sections",
             Self::FindByTitle => "find_by_title",
@@ -476,6 +609,41 @@ impl VdsTool {
                 "Rename document",
                 "Changes the human-readable document name while preserving the document ID.",
                 "Use this for display or storage-name changes; section IDs and history remain stable.",
+            ),
+            Self::GetDocumentLocation => (
+                "Get document location",
+                "Returns a document's canonical workspace-relative path, folder, filename, management state, and content hash.",
+                "Call this before path mutations so the returned content hash can guard against external edits.",
+            ),
+            Self::ManageDocumentFile => (
+                "Manage document file",
+                "Promotes discovered Markdown into durable .vds identity, metadata, and initial version history.",
+                "Use before durable file or section mutations on an unmanaged document.",
+            ),
+            Self::MoveDocumentFile => (
+                "Move document file",
+                "Moves a managed Markdown document to a new canonical workspace-relative path.",
+                "Provide the content hash returned by get_document_location; existing destinations are never overwritten by default.",
+            ),
+            Self::RenameDocumentFile => (
+                "Rename document file",
+                "Changes a managed Markdown filename while retaining its current parent folder.",
+                "Use for filename-only changes and provide the current expected content hash.",
+            ),
+            Self::RemoveDocumentFile => (
+                "Remove document file",
+                "Soft-deletes a managed Markdown file while retaining recoverable metadata, history, and a tombstone.",
+                "Use only after confirming the current content hash. Permanent history purge is intentionally separate.",
+            ),
+            Self::UnmanageDocumentFile => (
+                "Unmanage document file",
+                "Leaves Markdown in place while archiving or removing its active VDS management metadata.",
+                "Use when a file should remain in the project but no longer retain active stable VDS identity.",
+            ),
+            Self::RestoreDocumentFile => (
+                "Restore document file",
+                "Restores a soft-deleted document from the inactive archive, recreating its Markdown and reactivating its metadata.",
+                "Provide the document ID from a tombstone. Optionally supply a relative_path to restore to a different location.",
             ),
             Self::TableOfContents => (
                 "Table of contents",
@@ -622,11 +790,16 @@ impl VdsTool {
                 "Searches section titles and/or content using configurable options.",
                 "Use this when you know terms but not section IDs.",
             ),
+            Self::FullTextSearch => (
+                "Full-text search",
+                "Searches current section titles and content across the materialized workspace.",
+                "Use this for workspace-wide lexical discovery, optionally restricted by document or path prefix.",
+            ),
             #[cfg(feature = "semantic-search")]
             Self::SemanticSearchSections => (
                 "Semantic search sections",
-                "Searches embedded sections by nearest-neighbor semantic similarity.",
-                "Provide a query embedding, or provide query text with model and tokenizer paths so VDS can embed it before searching.",
+                "Searches sections by semantic similarity using HNSW nearest-neighbor index.",
+                "IMPORTANT: VDS does not generate embeddings. You must provide pre-computed embeddings via the query_embedding parameter. VDS caches embeddings by (section_id, content_hash, model) and maintains an HNSW index for fast approximate nearest neighbors. Build with --features semantic-search to enable this tool.",
             ),
             Self::FindByTitle => (
                 "Find by title",
@@ -675,23 +848,23 @@ impl VdsTool {
             ),
             Self::SetWorkspace => (
                 "Set workspace",
-                "Sets the workspace directory and uses <workspace>/.vds/vds.db as the database path.",
-                "Use this when the MCP server starts in a different directory than your project. The database will be reopened at the new location.",
+                "Sets the workspace directory. In filesystem mode (serve-v2), this controls which project root VDS materializes from Markdown. In legacy mode (serve), it sets <workspace>/.vds/vds.db as the database path.",
+                "Use this when the MCP server starts in a different directory than your project. The workspace will be reloaded at the new root.",
             ),
             Self::GetWorkspace => (
                 "Get workspace",
-                "Gets the current workspace directory if the database is in a .vds folder.",
-                "Use this to verify the current workspace configuration.",
+                "Returns the current workspace root, storage backend, watcher status, and reload count.",
+                "Use this to verify the current workspace and detect whether cached document data may be stale (reload_count increments on every live reload).",
             ),
             Self::SetDatabase => (
                 "Set database",
-                "Sets an explicit database file path, overriding the default .vds/vds.db location.",
-                "Use this for custom database locations. The database will be reopened at the new path.",
+                "Sets an explicit database file path (legacy VDS 1 mode only). Not applicable in filesystem-authoritative serve-v2 mode.",
+                "Use this in legacy mode for custom database locations. In serve-v2 mode this operation is not supported.",
             ),
             Self::GetDatabase => (
                 "Get database",
-                "Gets the current database file path.",
-                "Use this to verify which database file is currently in use.",
+                "Returns the current storage backend identifier. Returns 'filesystem' in serve-v2 mode and the database file path in legacy mode.",
+                "Use this to confirm which storage backend is active.",
             ),
         };
 
@@ -737,8 +910,8 @@ pub struct ToolDocumentation {
 pub fn endpoint_documentation() -> EndpointDocumentation {
     EndpointDocumentation {
         name: "Versioned Document Service",
-        description: "VDS lets agents work on long-form Markdown documents as stable, versioned section trees instead of rewriting entire files.",
-        usage: "Start with list_documents or import_document, use table_of_contents to discover stable section IDs, read targeted sections before editing, pass expected_version in EditOptions for writes, and use snapshots before broad structural changes.",
+        description: "VDS 2.0 manages long-form Markdown documents as stable, versioned section trees. Filesystem-authoritative: Markdown files are the source of truth, and .vds/ metadata stores IDs, version history, and snapshots as Git-friendly JSON.",
+        usage: "Start with list_documents or manage_document_file, use table_of_contents to discover stable section IDs, read sections before editing, pass expected_content_hash for conflict detection, use full_text_search for lexical discovery, and create snapshots before broad structural changes.",
         tools: tool_documentation(),
     }
 }
@@ -758,12 +931,16 @@ pub struct ListDocumentsParams {}
 /// Parameters for creating a document.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateDocumentParams {
-    /// Human-readable document name.
-    pub name: String,
+    /// Workspace-relative path for the new Markdown file (required in filesystem mode).
+    #[serde(default)]
+    pub relative_path: Option<String>,
+    /// Human-readable document name (defaults to filename stem when absent).
+    #[serde(default)]
+    pub name: Option<String>,
     /// Optional display title.
     pub title: Option<String>,
     /// Optional initial Markdown content to parse into sections.
-    #[serde(alias = "markdown")]
+    #[serde(alias = "markdown", default)]
     pub initial_content: Option<String>,
 }
 
@@ -806,6 +983,67 @@ pub struct RenameDocumentParams {
     pub document_id: DocumentId,
     /// New human-readable name.
     pub name: String,
+}
+
+/// Parameters for reading a document's authoritative filesystem location.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetDocumentLocationParams {
+    pub document_id: DocumentId,
+}
+
+/// Parameters for promoting a discovered Markdown file into managed metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManageDocumentFileParams {
+    pub document_id: DocumentId,
+}
+
+/// Parameters for moving a managed Markdown file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MoveDocumentFileParams {
+    pub document_id: DocumentId,
+    /// Canonical destination relative to the workspace root.
+    pub new_relative_path: String,
+    /// Hash returned by `get_document_location` before the move.
+    pub expected_content_hash: String,
+    /// Whether missing destination parent directories may be created.
+    #[serde(default)]
+    pub create_parent_directories: bool,
+}
+
+/// Parameters for a filename-only rename in the current parent folder.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RenameDocumentFileParams {
+    pub document_id: DocumentId,
+    /// New filename, including the Markdown extension and no directory components.
+    pub new_filename: String,
+    pub expected_content_hash: String,
+}
+
+/// Parameters for soft deletion of a managed Markdown file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoveDocumentFileParams {
+    pub document_id: DocumentId,
+    pub expected_content_hash: String,
+}
+
+/// Parameters for leaving Markdown in place while ending active management.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnmanageDocumentFileParams {
+    pub document_id: DocumentId,
+    pub expected_content_hash: String,
+    /// Preserve metadata and history in an inactive archive. Defaults to true.
+    #[serde(default = "default_true")]
+    pub archive_history: bool,
+}
+
+/// Parameters for restoring a soft-deleted document from the inactive archive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RestoreDocumentFileParams {
+    /// Archived document to restore.
+    pub document_id: DocumentId,
+    /// Optional workspace-relative path to restore to. Defaults to original path.
+    #[serde(default)]
+    pub relative_path: Option<String>,
 }
 
 /// Parameters for generating a document table of contents.
@@ -1154,6 +1392,25 @@ pub struct SearchSectionsParams {
     pub options: Option<SearchOptions>,
 }
 
+/// Parameters for workspace-wide indexed lexical search.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FullTextSearchParams {
+    /// Lexical query. A term ending in `*` performs prefix expansion.
+    pub query: String,
+    /// Optional document restriction.
+    #[serde(default)]
+    pub document_id: Option<DocumentId>,
+    /// Optional canonical workspace-relative path prefix.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Whether every query atom must match. Defaults to true.
+    #[serde(default = "default_true")]
+    pub require_all_terms: bool,
+    /// Maximum number of results. Defaults to 50.
+    #[serde(default, alias = "limit")]
+    pub max_results: Option<u32>,
+}
+
 /// Parameters for semantic nearest-neighbor section search.
 #[cfg(feature = "semantic-search")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1299,6 +1556,15 @@ pub struct WorkspaceInfo {
     pub workspace: Option<String>,
     /// Current database file path.
     pub database: String,
+    /// Whether a filesystem watcher is actively monitoring the workspace for external changes.
+    #[serde(default)]
+    pub watcher_active: bool,
+    /// Number of live reloads that have completed since the server started.
+    /// Zero on initial load; increments each time an external change or VDS
+    /// mutation triggers a workspace rebuild.  Clients can compare successive
+    /// values to detect that cached document or section data may be stale.
+    #[serde(default)]
+    pub reload_count: u64,
 }
 
 /// Database information result.
@@ -1323,6 +1589,29 @@ pub struct DocumentInfo {
     pub current_version: VersionId,
     /// Last document update time.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Authoritative location and change-detection state for one Markdown file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DocumentLocation {
+    pub document_id: DocumentId,
+    pub relative_path: String,
+    pub folder: String,
+    pub filename: String,
+    pub managed: bool,
+    pub source_matches_metadata: bool,
+    pub content_hash: String,
+}
+
+/// Common result for document filesystem lifecycle mutations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DocumentFileMutationResult {
+    pub document_id: DocumentId,
+    pub previous_relative_path: String,
+    /// Current path, or `None` when the active Markdown file was removed.
+    pub relative_path: Option<String>,
+    pub content_hash: Option<String>,
+    pub managed: bool,
 }
 
 /// Result returned after exporting a document.
@@ -1459,6 +1748,25 @@ pub struct SectionSearchResult {
     /// Whether the title matched.
     pub title_match: bool,
     /// Content match snippets.
+    pub content_matches: Vec<TextMatch>,
+}
+
+/// Workspace-aware result returned by indexed lexical search.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FullTextSearchResult {
+    /// Document containing the matching section.
+    pub document_id: DocumentId,
+    /// Canonical workspace-relative Markdown path.
+    pub relative_path: String,
+    /// Matching section summary.
+    pub section: SectionInfo,
+    /// Heading titles from the document root to the section parent.
+    pub heading_ancestry: Vec<String>,
+    /// BM25-style relevance score.
+    pub score: f32,
+    /// Whether the section title matched.
+    pub title_match: bool,
+    /// Content match snippets and byte offsets.
     pub content_matches: Vec<TextMatch>,
 }
 

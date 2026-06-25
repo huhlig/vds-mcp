@@ -636,13 +636,13 @@ fn permanent_mcp_semantic_search_smoke() {
                 vector: vec![1.0, 0.0],
             }),
             model: None,
-            options: SemanticSearchOptions {
+            options: Some(SemanticSearchOptions {
                 max_results: Some(1),
                 ef: Some(8),
                 m: Some(8),
                 ef_construction: Some(100),
                 require_same_model: true,
-            },
+            }),
         })
         .unwrap();
 

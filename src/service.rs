@@ -651,7 +651,9 @@ impl VdsMcpSurface for VdsServer {
             name,
             title,
             initial_content,
+            relative_path: _,
         } = params;
+        let name = name.unwrap_or_default();
         let import_name = title.clone().unwrap_or_else(|| name.clone());
         let mut document = import_markdown_str(
             &*self.store(),
@@ -1580,6 +1582,8 @@ impl VdsMcpSurface for VdsServer {
         Ok(WorkspaceInfo {
             workspace: self.get_workspace_path().map(|p| p.to_string_lossy().into_owned()),
             database: database.to_string_lossy().into_owned(),
+            watcher_active: false,
+            reload_count: 0,
         })
     }
 
@@ -1588,6 +1592,8 @@ impl VdsMcpSurface for VdsServer {
         Ok(WorkspaceInfo {
             workspace: self.get_workspace_path().map(|p| p.to_string_lossy().into_owned()),
             database: database.to_string_lossy().into_owned(),
+            watcher_active: false,
+            reload_count: 0,
         })
     }
 
@@ -1614,6 +1620,11 @@ impl VdsMcpSurface for VdsServer {
 impl ServerHandler for VdsServer {
     fn get_info(&self) -> ServerInfo {
         let docs = endpoint_documentation();
+        let tool_count = docs
+            .tools
+            .iter()
+            .filter(|documentation| !is_filesystem_only_tool(documentation.tool))
+            .count();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -1623,7 +1634,7 @@ impl ServerHandler for VdsServer {
             .with_instructions(format!(
                 "{}\n\nAvailable capabilities: tools/list and tools/call. {} tools are advertised through tools/list. {}",
                 docs.description,
-                docs.tools.len(),
+                tool_count,
                 docs.usage
             ))
     }
@@ -1638,6 +1649,7 @@ impl ServerHandler for VdsServer {
             next_cursor: None,
             tools: tool_documentation()
                 .into_iter()
+                .filter(|documentation| !is_filesystem_only_tool(documentation.tool))
                 .map(tool_from_doc)
                 .collect(),
         })
@@ -1716,7 +1728,20 @@ fn parse<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpErr
         .map_err(|error| mcp_error(McpErrorCode::InvalidInput, error.to_string()))
 }
 
-fn tool_from_doc(doc: ToolDocumentation) -> Tool {
+fn is_filesystem_only_tool(tool: VdsTool) -> bool {
+    matches!(
+        tool,
+        VdsTool::FullTextSearch
+            | VdsTool::GetDocumentLocation
+            | VdsTool::ManageDocumentFile
+            | VdsTool::MoveDocumentFile
+            | VdsTool::RenameDocumentFile
+            | VdsTool::RemoveDocumentFile
+            | VdsTool::UnmanageDocumentFile
+    )
+}
+
+pub(crate) fn tool_from_doc(doc: ToolDocumentation) -> Tool {
     Tool::new(
         doc.name,
         format!("{} {}", doc.description, doc.usage),
@@ -1785,6 +1810,64 @@ fn tool_schema(tool: VdsTool) -> Value {
                 string_prop("name", "New human-readable document name."),
             ],
             vec![],
+        ),
+        VdsTool::GetDocumentLocation | VdsTool::ManageDocumentFile => {
+            object_schema(vec![document_id_prop()], vec![])
+        }
+        VdsTool::MoveDocumentFile => object_schema(
+            vec![
+                document_id_prop(),
+                string_prop("new_relative_path", "Workspace-relative destination path."),
+                string_prop(
+                    "expected_content_hash",
+                    "Content hash returned by get_document_location.",
+                ),
+            ],
+            vec![bool_prop(
+                "create_parent_directories",
+                "Whether missing destination parent directories may be created.",
+            )],
+        ),
+        VdsTool::RenameDocumentFile => object_schema(
+            vec![
+                document_id_prop(),
+                string_prop("new_filename", "New Markdown filename without directories."),
+                string_prop(
+                    "expected_content_hash",
+                    "Content hash returned by get_document_location.",
+                ),
+            ],
+            vec![],
+        ),
+        VdsTool::RemoveDocumentFile => object_schema(
+            vec![
+                document_id_prop(),
+                string_prop(
+                    "expected_content_hash",
+                    "Content hash returned by get_document_location.",
+                ),
+            ],
+            vec![],
+        ),
+        VdsTool::UnmanageDocumentFile => object_schema(
+            vec![
+                document_id_prop(),
+                string_prop(
+                    "expected_content_hash",
+                    "Content hash returned by get_document_location.",
+                ),
+            ],
+            vec![bool_prop(
+                "archive_history",
+                "Whether metadata and history should be archived.",
+            )],
+        ),
+        VdsTool::RestoreDocumentFile => object_schema(
+            vec![document_id_prop()],
+            vec![string_prop(
+                "relative_path",
+                "Optional workspace-relative path to restore the document to. Defaults to the original path.",
+            )],
         ),
         VdsTool::TableOfContents => object_schema(vec![document_id_prop()], vec![]),
         VdsTool::GetSection => section_target_schema(),
@@ -2032,6 +2115,33 @@ fn tool_schema(tool: VdsTool) -> Value {
                 "options",
                 nullable(search_options_schema(), "Search behavior options."),
             )],
+        ),
+        VdsTool::FullTextSearch => object_schema(
+            vec![string_prop("query", "Workspace lexical search query.")],
+            vec![
+                json_prop(
+                    "document_id",
+                    nullable(
+                        string_schema("Optional document restriction."),
+                        "Optional document restriction.",
+                    ),
+                ),
+                json_prop(
+                    "path_prefix",
+                    nullable(
+                        string_schema("Optional workspace-relative path prefix."),
+                        "Optional workspace-relative path prefix.",
+                    ),
+                ),
+                bool_prop("require_all_terms", "Whether every query atom must match."),
+                json_prop(
+                    "max_results",
+                    nullable(
+                        integer_schema("Maximum number of results."),
+                        "Maximum number of results.",
+                    ),
+                ),
+            ],
         ),
         #[cfg(feature = "semantic-search")]
         VdsTool::SemanticSearchSections => object_schema(
@@ -2616,7 +2726,7 @@ fn semantic_result_distance(result: &hnsw_vector_search::hnsw::SearchResult) -> 
     result.1
 }
 
-fn to_rmcp_error(error: McpError) -> RmcpError {
+pub(crate) fn to_rmcp_error(error: McpError) -> RmcpError {
     let data = Some(json!({
         "code": error.code,
         "message": error.message,

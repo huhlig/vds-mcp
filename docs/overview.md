@@ -1,181 +1,143 @@
-# Versioned Document Service Overview
+# Versioned Document Service — Architecture Overview
 
-Versioned Document Service (VDS) is an MCP-oriented document service for long-form Markdown documents. Its purpose is to
-let agents and tools work with large documents through stable, structured operations instead of repeatedly rewriting
-whole files as raw text.
+Versioned Document Service (VDS) is an MCP server for long-form Markdown documents. Its purpose is to let agents and tools work with large documents through stable, structured operations instead of repeatedly rewriting whole files.
 
-Large Markdown files are easy to corrupt when an agent has to regenerate or patch them from context. VDS addresses that
-by giving every document and section a durable identity, storing the document as a tree, and exposing read, search,
-version, import, and export operations through a service boundary.
+Large Markdown files are easy to corrupt when an agent has to regenerate or patch them from context. VDS addresses that by giving every document and section a durable identity, exposing surgical section-level edits with crash recovery, and maintaining a workspace-wide full-text index — all while keeping the Markdown file itself as the source of truth.
 
-## What It Does
+## Filesystem-Authoritative Design (VDS 2)
 
-VDS imports Markdown into a persistent internal model, stores that model in a local `redb` database, and renders
-documents or sections back to Markdown when needed.
+VDS 2 treats the project filesystem as authoritative. The Markdown file is the document; VDS metadata (`.vds/`) stores only what cannot be reconstructed from the file: stable IDs, version history, and snapshots.
 
-The current implementation supports:
+This means:
 
-- Starting an MCP server over stdio.
-- Starting an MCP server over streamable HTTP.
-- Creating and importing Markdown documents.
-- Listing, reading, and renaming documents.
-- Building a table of contents from the stored section tree.
-- Reading individual sections or section subtrees.
-- Rendering one section or a whole document back to Markdown.
-- Exporting a stored document to a Markdown file.
-- Creating, inserting, updating, patching, moving, reordering, promoting, demoting, splitting, and removing sections.
-- Switching and diffing section versions.
-- Creating, restoring, and diffing document snapshots.
-- Deleting documents and their associated stored records.
-- Listing section versions and document snapshots that exist in storage.
-- Searching section titles and content with simple text matching.
-- Finding sections by title or tag.
-- Listing recent section-version and snapshot changes.
-- Cooperative section locking and unlocking.
-- Checking optimistic concurrency conflicts against a section version.
-- Basic validation, normalization, and repair endpoints that currently return no changes.
+- Humans and agents can edit Markdown side by side. VDS detects external changes using SHA-256 hashes and reloads the affected document.
+- The workspace is safe to commit to Git or sync with Dropbox. All `.vds/` files are plain JSON.
+- Removing `.vds/` and restarting loses history but not content. The Markdown file is always the ground truth.
 
-## How It Works
+## Document Model
 
-Markdown is treated as a boundary format, not as the primary storage model. On import, VDS parses Markdown headings with
-`pulldown-cmark` and turns the document into a tree of sections:
+VDS parses Markdown headings into a section tree:
 
 ```text
 Document
-  root Section
-    Section
-      Section
-    Section
+  root Section            ← synthetic; holds content before the first heading
+    Section (H1)
+      Section (H2)
+    Section (H1)
 ```
 
-Each document has a stable `DocumentId`. Each section has a stable `SectionId` that survives title changes, moves, and
-content edits. Each section also points at a current `VersionId`, allowing callers to detect stale edits and eventually
-restore or diff historical versions.
+Each document has a stable `DocumentId`. Each section has a stable `SectionId` that survives title changes, moves, and content edits. Sections reference a `VersionId` that enables optimistic concurrency and historical diffs.
 
-The importer creates a synthetic root section for each document. Content before the first Markdown heading is stored on
-that root. Normal headings become child sections whose parentage is inferred from heading level, so an `h3` becomes a
-descendant of the nearest preceding lower-level heading. Headings inside fenced code blocks are ignored because parsing
-is delegated to `pulldown-cmark`.
+Section content is stored verbatim from the Markdown file. Fenced code blocks, HTML comments, and heading ID attributes (`{#anchor}`) are preserved exactly during both surgical edits (byte-range replacements) and canonical re-renders (structural mutations).
 
-The exporter walks the stored section tree in sibling ordinal order and renders the structure back to Markdown.
-Whole-document export omits the synthetic root heading, while section rendering includes the requested section heading
-and can optionally include descendants.
+## Mutation Durability
 
-## Basic Architecture
+Every write goes through a crash-recoverable transaction:
 
-The project is a Rust crate with one library and one CLI binary.
+1. **Intent record** is written first — identifies the mutation type and expected state.
+2. **Staged files** are written to a temporary directory.
+3. **Atomic rename** moves staged files into place.
+4. **Intent record** is deleted to confirm completion.
 
-```text
-src/
-  bin.rs        CLI entry point and command dispatch
-  lib.rs        Public module wiring and high-level crate documentation
-  document.rs   Core document, section, version, snapshot, patch, and metadata types
-  markdown.rs   Markdown import, parsing, section-tree construction, and export
-  storage.rs    redb-backed persistence facade and secondary indexes
-  mcp.rs        Transport-neutral MCP request/response types and tool documentation
-  service.rs    Runtime MCP server adapter and storage-backed command handlers
+On restart, `recover_transactions` scans incomplete intents and either completes or rolls back each one. No write is ever partially visible.
+
+## Conflict Detection
+
+Callers supply an `expected_content_hash` with every mutation. If the Markdown file was externally edited between read and write, the hash check fails with `ExternalContentConflict`. This prevents silent overwrites when humans and agents edit concurrently.
+
+## In-Memory Index
+
+On startup, VDS reads all managed Markdown files and builds an in-memory `WorkspaceGeneration`:
+
+- **WorkspaceState** — materialized documents, sections, and managed metadata
+- **FullTextIndex** — BM25-scored inverted index over section titles and content
+
+After each mutation, `reload_incremental` updates only the affected document's postings rather than rebuilding the full index. The filesystem watcher triggers a full reload when external changes are detected.
+
+### Full-Text Search
+
+The search index supports:
+
+- **Term queries** — tokenized words scored by BM25
+- **Prefix queries** — `term*` expands to all indexed terms with that prefix
+- **Phrase queries** — `"exact phrase"` matches contiguous substrings in title or content
+- **camelCase / PascalCase / acronym splitting** — `camelCase` indexes as both `camelcase` and `camel` + `case`
+- **Path prefix filters** — constrain results to a subtree of the workspace
+- **AND / OR modes** — `require_all_terms` controls whether all atoms must match
+
+## Filesystem Watcher
+
+A background thread uses `notify` to watch the workspace for file changes. It debounces burst events (300 ms drain loop) and filters editor backup files and OS noise. When a stable change is detected, it rebuilds the workspace generation atomically and publishes it under the existing `RwLock`.
+
+`watcher_active` and `reload_count` fields in `get_workspace` allow clients to detect stale cached data.
+
+## Workspace Lease
+
+VDS acquires a lock file outside the synchronized project tree to prevent two writable VDS processes from targeting the same workspace simultaneously. Read-only materialization is available without acquiring the lease.
+
+## .vds Metadata Layout
+
+```
+.vds/
+├── workspace.json                 ← workspace identity (UUID) and format version
+├── documents/
+│   └── doc-<id>/
+│       ├── document.json          ← stable document identity and metadata
+│       ├── current.json           ← current content hash, root section ID, version
+│       ├── sections/
+│       │   └── sec-<id>.json      ← section identity, current version, matching hints
+│       ├── versions/
+│       │   └── sec-<id>/
+│       │       └── ver-<id>.json  ← immutable section version (title, content, author, …)
+│       └── snapshots/
+│           └── snap-<id>.json     ← point-in-time document tree capture
+├── inactive/
+│   └── doc-<id>/                  ← soft-deleted documents with full archived history
+└── recovery/
+    └── <uuid>/                    ← in-progress transaction staging (cleaned on commit)
 ```
 
-### CLI Layer
+All files use `format_version: 1`. Version mismatches are detected at load time and reject the file before any fields are read.
 
-`src/bin.rs` defines the `vds` command using `clap`. It supports server startup and basic document operations:
+## Module Map
 
-```text
-vds serve
-vds server --bind 127.0.0.1:8001 --path /mcp
-vds list
-vds import <path>
-vds export <document_id>
+| Module | Role |
+|---|---|
+| `document.rs` | Shared data types: Document, Section, SectionVersion, DocumentSnapshot, IDs, ValidationDiagnostic |
+| `filesystem_service.rs` | VDS 2 MCP server — routing, mutation, search, workspace management |
+| `markdown.rs` | Markdown parser (pulldown-cmark), section-tree construction, renderer |
+| `metadata.rs` | .vds JSON reads/writes, recoverable transactions, catalog loading |
+| `search.rs` | In-memory BM25 full-text index, camelCase tokenization, phrase queries |
+| `workspace.rs` | Workspace discovery, .vdsignore matching, state materialization, watcher |
+| `mcp.rs` | MCP parameter and result types, tool documentation strings |
+| `service.rs` | VDS 1 legacy MCP server (redb-backed) |
+| `storage.rs` | VDS 1 redb storage layer (legacy) |
+
+## Typical Agent Workflows
+
+**Read a section:**
+```
+get_workspace → list_documents → table_of_contents → get_section
 ```
 
-The CLI defaults to `.vds/vds.db` for local storage. Text output goes to stdout unless `--output` is provided.
-
-### MCP Surface
-
-`src/mcp.rs` defines the transport-neutral API. The central trait is `VdsMcpSurface`, which describes all document
-lifecycle, navigation, editing, versioning, search, validation, repair, locking, and conflict-check commands.
-
-This module also defines the request and response structs used by those commands. Keeping these types separate from the
-runtime server lets the project document and evolve the command contract independently from a specific transport.
-
-### Service Adapter
-
-`src/service.rs` implements `VdsMcpSurface` for `VdsServer`. It adapts incoming MCP tool calls to typed command
-handlers, serializes structured results, maps service errors to MCP errors, and exposes tools through the `rmcp` server
-interface.
-
-The same `VdsServer` can be served over:
-
-- stdio, for local MCP clients that launch the process directly.
-- streamable HTTP, for clients that connect to an HTTP endpoint.
-
-### Storage Layer
-
-`src/storage.rs` wraps `redb` behind `DocumentStore`. Records are stored as JSON payloads in redb tables, with secondary
-index tables for query patterns the service needs:
-
-- document lookup and listing
-- document-name lookup
-- all sections in a document
-- parent-to-child traversal in ordinal order
-- section-version history
-- document-snapshot history
-
-Most write paths use transactions so related records and indexes are updated together.
-
-### Markdown Boundary
-
-`src/markdown.rs` owns import and export. It converts Markdown into the internal tree model and converts stored trees
-back to Markdown strings or files.
-
-This is the key architectural choice in VDS: Markdown remains the format humans read and write at the edges, but agents
-operate on stable document and section IDs inside the service.
-
-## Data Flow
-
-Typical import and export flow:
-
-```text
-Markdown file
-  -> pulldown-cmark parser
-  -> Document + Section tree + initial SectionVersion records
-  -> DocumentStore / redb
-  -> MCP tools or CLI commands
-  -> rendered Markdown string or file
+**Edit a section safely:**
+```
+get_section → note current_version and content_hash
+update_section { expected_content_hash: "<hash>", content: "…" }
 ```
 
-Typical agent read flow:
-
-```text
-list_documents
-  -> table_of_contents
-  -> get_section or get_section_tree
-  -> render_section_markdown when human-readable Markdown is needed
+**Search across the workspace:**
+```
+full_text_search { query: "\"exact phrase\"", max_results: 10 }
+full_text_search { query: "camelCase tokenization*", require_all_terms: true }
 ```
 
-Typical safe edit flow, as the full editing surface is implemented:
-
-```text
-get_section
-  -> inspect current_version
-  -> update or patch with expected_version
-  -> store a new SectionVersion
-  -> use check_conflicts when stale context is possible
+**Create a snapshot before a large edit:**
+```
+create_document_snapshot { document_id: "…", label: "before refactor" }
 ```
 
-## Design Goals
-
-- Stable addressability: callers edit sections by ID, not by fragile heading text or byte offsets in a whole file.
-- Incremental context: agents can request just the table of contents, one section, or a subtree.
-- Version awareness: section versions and document snapshots provide a foundation for history, rollback, and conflict
-  detection.
-- Markdown compatibility: documents can still enter and leave the system as regular Markdown.
-- Transport flexibility: the same service can run through stdio or streamable HTTP MCP transports.
-
-## Current Status
-
-VDS currently has the foundation in place: data types, MCP command definitions, local persistence, Markdown
-import/export, basic search, basic conflict checks, and server transports.
-
-The next major implementation work is the mutation and history surface: creating, updating, patching, moving, deleting,
-diffing, snapshotting, restoring, and locking sections with full version persistence.
+**Restore after a bad edit:**
+```
+document_snapshots → diff_document_snapshots → restore_document_snapshot
+```

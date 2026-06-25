@@ -1,192 +1,193 @@
 # Versioned Document Service
 
-Versioned Document Service (VDS) is a Rust MCP service for managing long-form Markdown documents as versioned section
-trees. It is designed for agents and tools that need to edit, inspect, search, and export large documents without
-rewriting the whole file each time.
+Versioned Document Service (VDS) is a Rust MCP server for managing long-form Markdown documents as versioned, addressable section trees. It is designed for agents and tools that need to read, edit, search, and snapshot large documents without rewriting whole files each time.
 
-Markdown is the import and export format. Internally, VDS stores documents as stable, addressable sections with document
-IDs, section IDs, version IDs, metadata, and parent/child relationships.
+VDS 2 (`serve-v2`) is the current recommended mode. It treats the project filesystem as authoritative: Markdown lives in your project directory and can be read and edited by humans and agents side by side. VDS metadata (`.vds/`) stores stable IDs, version history, and snapshots as plain JSON files that are safe to commit to Git or sync with Dropbox.
 
 ## Features
 
-- Import Markdown into a persistent section tree.
-- Export stored documents back to Markdown.
-- Serve MCP tools over stdio or streamable HTTP.
-- List, read, rename, and render documents.
-- Read sections, section trees, and tables of contents.
-- Search section titles and content.
-- Store section versions and document snapshots.
-- Check optimistic concurrency conflicts against section versions.
+**VDS 2.0 (filesystem-authoritative)** — Production ready ✅
 
-Several editing and history tools are defined in the MCP surface but are still being implemented in the storage-backed
-service.
+- Markdown files live in your project directory and are the source of truth.
+- Stable document and section IDs survive renames, moves, and external edits.
+- Every section edit creates an immutable version record on disk.
+- Document snapshots capture a full tree at a named point in time.
+- **Full-text search** with BM25 ranking, prefix queries, phrase queries, and camelCase tokenization.
+- **Semantic search** (optional `semantic-search` feature) — HNSW vector index with external embedding cache.
+- Filesystem watcher reloads changed documents without restarting the server.
+- Single-writer workspace lease prevents concurrent write conflicts.
+- Crash-recoverable transactions protect every mutation.
+- Safe runtime workspace switching via `set_workspace`.
+- All metadata stored as Git-friendly JSON files.
+
+**Legacy VDS 1 (`serve`)** — backed by a local `redb` database. Retained for compatibility; VDS 2 is recommended for all new workspaces.
 
 ## Installation
 
-Install from crates.io with:
-
-```powershell
-cargo install --locked vds-mcp
-```
-
-Install from this repository checkout:
+From a local checkout:
 
 ```powershell
 cargo install --locked --path .
 ```
 
-Install from a Git repository:
+From a Git repository:
 
 ```powershell
 cargo install --locked --git <repo-url> vds-mcp
 ```
 
-Verify the installed binary:
+Verify the binary is on `PATH`:
 
 ```powershell
 vds-mcp --help
 ```
 
-Onboard your project with:
+## Quick Start
+
+Run the VDS 2 stdio MCP server for your project:
 
 ```powershell
-cd /path/to/project
-vds-mcp onboard
+vds-mcp --workspace /path/to/project serve-v2
 ```
 
-## Project Structure
-
-```
-vds-mcp/
-├── benches/               # Service Benchmakrs 
-│   └── benchmark.rs
-├── docs/                  # Project Documentation
-│   ├── installation.md    # Command Line Wrapper
-│   └── overview.md
-├── src/
-│   ├── bin.rs             # Command Line Wrapper
-│   ├── document.rs        # Core Document Model
-│   ├── lib.rs             # Main Library File
-│   ├── markdown.rs        # Markdown Utilities
-│   ├── mcp.rs             # MCP Facade
-│   ├── service.rs         # MCP Service
-│   └── storage.rs         # Storage Backend
-├── tests/
-│   ├── mcp_smoke.rs       # MCP Smoke Tests
-│   └── overview.rs        # Integration Tests
-├── AGENTS.md              # VDS Agent Usage Instructions
-├── Cargo.toml             # Workspace configuration
-├── CONTRIBUTING.md        # This file
-├── LICENSE.md             # Apache2 License
-└── README.md              # Project Readme.
-```
-
-## Usage
-
-Build locally without installing:
+Or start the HTTP server:
 
 ```powershell
-cargo build
+vds-mcp --workspace /path/to/project server-v2 --bind 127.0.0.1:8001 --path /mcp
 ```
 
-Run the stdio MCP server:
+VDS initializes `.vds/` metadata on first run. Existing Markdown files in the workspace are discovered automatically but not tracked until `manage_document_file` is called or a document is created through VDS. All `.vds/` JSON files (except the binary database lock) are Git-safe.
 
-```powershell
-cargo run -- serve
-```
+## MCP Client Configuration
 
-In `serve` mode, VDS is meant to be launched by an MCP client. It writes a startup banner to stderr that advertises the
-service name, transport, `tools/list` and `tools/call` capabilities, usage guidance, and every available MCP tool. Stdout
-is reserved for MCP protocol messages.
+**Claude Desktop / stdio clients** — add to your MCP server configuration:
 
-Run the streamable HTTP MCP server:
-
-```powershell
-cargo run -- server --bind 127.0.0.1:8001 --path /mcp
-```
-
-Import a Markdown document:
-
-```powershell
-cargo run -- import docs/context1.md
-```
-
-List stored documents:
-
-```powershell
-cargo run -- list
-```
-
-Export a document:
-
-```powershell
-cargo run -- export <document_id> --output exported.md
-```
-
-By default, VDS stores data in `.vds/vds.db`. Use `--database <path>` to choose another database file.
-
-## MCP Agent Configuration
-
-For stdio-based MCP clients, add VDS as an MCP server with the installed `vds-mcp` binary. Use an absolute database path so
-the agent stores documents in a predictable location (it will store in `./.vds/vds.db` by default):
-
-Simple Use:
 ```json
 {
   "mcpServers": {
-    "vds-mcp": {
+    "vds": {
       "command": "vds-mcp",
-      "args": [
-        "serve"
-      ]
+      "args": ["--workspace", "/absolute/path/to/project", "serve-v2"]
     }
   }
 }
 ```
 
-
-With Database: 
-```json
-{
-  "mcpServers": {
-    "vds-mcp": {
-      "command": "vds-mcp",
-      "args": [
-        "--database",
-        "E:\\Projects\\vds-mcp\\.vds\\vds.db",
-        "serve"
-      ]
-    }
-  }
-}
-```
-
-For Codex-style TOML MCP configuration:
-
-```toml
-[mcp_servers.vds-mcp]
-command = "vds-mcp"
-args = ["--database", "E:\\Projects\\vds-mcp\\.vds\\vds.db", "serve"]
-```
-
-For HTTP-capable MCP clients, run VDS separately:
+**HTTP clients** — run the server separately and point the client at it:
 
 ```powershell
-vds-mcp --database E:\Dropbox\Projects\IBM\vds\.vds\vds.db server --bind 127.0.0.1:8001 --path /mcp
+vds-mcp --workspace E:\Projects\myproject server-v2 --bind 127.0.0.1:8001 --path /mcp
 ```
-
-Then point the client at:
 
 ```text
 http://127.0.0.1:8001/mcp
 ```
 
-Both server modes advertise the same tool capability set during MCP initialization. Clients can call `tools/list` to get
-the full catalog and `tools/call` to invoke a tool.
+**Codex TOML**:
 
-See [docs/installation.md](docs/installation.md) for more installation and MCP client examples.
+```toml
+[mcp_servers.vds]
+command = "vds-mcp"
+args = ["--workspace", "/absolute/path/to/project", "serve-v2"]
+```
+
+## Workspace Layout
+
+```
+project/
+├── docs/
+│   ├── overview.md          ← your Markdown files (VDS 2 is authoritative)
+│   └── installation.md
+├── .vds/
+│   ├── workspace.json       ← workspace identity and format version
+│   └── documents/
+│       └── doc-<id>/
+│           ├── document.json   ← stable document identity and metadata
+│           ├── current.json    ← current content hash and root section
+│           ├── sections/       ← per-section identity and matching hints
+│           ├── versions/       ← immutable section version history (JSON)
+│           └── snapshots/      ← document snapshot records (JSON)
+└── .vdsignore               ← optional glob patterns to exclude files
+```
+
+`.vds/` files are plain JSON and safe to commit. The only binary file (`vds.lock`) is excluded from Git automatically.
+
+## .vdsignore
+
+Create `.vdsignore` in the workspace root to exclude Markdown files from discovery:
+
+```
+# Ignore generated output
+generated/
+
+# But include the operator guide even inside generated/
+!generated/operator-guide.md
+
+# Ignore all drafts
+drafts/*.md
+```
+
+Patterns follow a subset of Gitignore syntax: glob matching, `!` negation, and trailing `/` for directory matching. `.gitignore` is not read automatically.
+
+## Key MCP Operations
+
+| Category | Tools |
+|---|---|
+| Documents | `list_documents`, `create_document`, `get_document`, `get_document_location`, `manage_document_file`, `rename_document`, `rename_document_file`, `move_document_file`, `import_document`, `export_document`, `remove_document_file`, `restore_document_file`, `unmanage_document_file` |
+| Sections | `get_section`, `get_section_tree`, `get_sections`, `table_of_contents`, `create_section`, `update_section`, `append_to_section`, `rename_section`, `insert_section_before`, `insert_section_after`, `move_section`, `reorder_sections`, `promote_section`, `demote_section`, `remove_section`, `split_section`, `patch_section`, `set_section_metadata`, `render_section_markdown`, `render_document_markdown` |
+| History | `section_versions`, `get_section_version`, `diff_section_versions`, `switch_section_version` |
+| Snapshots | `create_document_snapshot`, `document_snapshots`, `diff_document_snapshots`, `restore_document_snapshot` |
+| Search | `full_text_search`, `semantic_search_sections`* (feature-gated), `find_by_title`, `find_by_tag` |
+| Workspace | `get_workspace`, `set_workspace`, `validate_document` |
+
+**\* Semantic search requires pre-computed embeddings** — VDS stores and indexes embeddings but does not generate them. Clients must provide embedding vectors via the `query_embedding` parameter.
+
+## Semantic Search (Optional Feature)
+
+Build with semantic search support:
+
+```bash
+cargo build --features semantic-search
+```
+
+**Platform support:** Linux and macOS only. The `hnsw_vector_search` dependency does not build on Windows.
+
+**How it works:**
+- VDS maintains an external embedding cache at `{cache_dir}/vds/workspaces/{workspace_id}/embeddings.zst`
+- Embeddings are keyed by `(section_id, content_hash, model)` for automatic invalidation on edits
+- Cache uses postcard serialization with CRC checksums and zstd compression (~1.1-1.3x ratio)
+- The HNSW vector index is built per workspace generation for fast nearest-neighbor search
+- Clients must provide pre-computed embeddings — VDS does not call embedding models
+
+**Cache location by platform:**
+- **macOS:** `~/Library/Caches/vds/workspaces/{workspace_id}/embeddings.zst`
+- **Linux:** `~/.cache/vds/workspaces/{workspace_id}/embeddings.zst`
+- **Windows:** `%LOCALAPPDATA%\vds\workspaces\{workspace_id}\embeddings.zst` (build not supported)
 
 ## Documentation
 
-See [docs/overview.md](docs/overview.md) for a deeper explanation of the project purpose, current behavior, data flow,
-and architecture.
+- [docs/overview.md](docs/overview.md) — architecture, data flow, and design decisions
+- [docs/installation.md](docs/installation.md) — detailed installation and client setup
+
+## Project Structure
+
+```
+src/
+├── bin.rs                 ← CLI entry point
+├── document.rs            ← shared document model (Document, Section, SectionVersion, TextEmbedding)
+├── embedding_cache.rs     ← external zstd+postcard embedding cache (feature: semantic-search)
+├── filesystem_service.rs  ← VDS 2 MCP server (filesystem-authoritative)
+├── markdown.rs            ← Markdown parser and renderer
+├── mcp.rs                 ← MCP tool parameter and result types
+├── metadata.rs            ← .vds JSON metadata and recoverable transactions
+├── search.rs              ← in-memory BM25 full-text index
+├── semantic.rs            ← HNSW vector index for semantic search (feature: semantic-search)
+├── service.rs             ← VDS 1 MCP server (legacy redb-backed)
+├── storage.rs             ← VDS 1 redb storage layer (legacy)
+└── workspace.rs           ← workspace discovery and materialization
+tests/
+├── markdown_golden.rs     ← exact-byte Markdown mutation golden tests
+├── mcp_protocol.rs        ← end-to-end VDS 2 MCP protocol tests
+├── mcp_smoke.rs           ← VDS 1 smoke tests
+└── overview.rs            ← VDS 1 integration tests
+```

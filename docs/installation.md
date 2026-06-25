@@ -1,15 +1,13 @@
 # Installing and Configuring VDS
 
-VDS is distributed as the `vds-mcp` crate, which installs a Rust binary named `vds-mcp`. Once installed, it can be
-launched directly by MCP clients over stdio or run as a streamable HTTP MCP server.
+VDS is distributed as the `vds-mcp` crate. Installation produces a binary named `vds-mcp` that can be launched by MCP clients over stdio or run as a streamable HTTP MCP server.
 
 ## Prerequisites
 
-- Rust and Cargo installed.
-- A local directory where VDS can create its database file.
+- Rust and Cargo (stable toolchain).
+- A project directory where your Markdown files live (the VDS 2 workspace).
 
-The default database path is `.vds/vds.db`, relative to the process working directory. For MCP clients, prefer an
-absolute `--database` path so data does not move when the client launches VDS from a different directory.
+VDS 2 does not require a database file. It creates a `.vds/` directory inside the workspace on first use and stores all metadata there as plain JSON.
 
 ## Install With Cargo
 
@@ -31,97 +29,125 @@ After publication to crates.io:
 cargo install --locked vds-mcp
 ```
 
-Confirm that Cargo installed the binary:
+Confirm the binary is available:
 
 ```powershell
 vds-mcp --help
 ```
 
-Cargo installs binaries into Cargo's bin directory, commonly `%USERPROFILE%\.cargo\bin` on Windows. Make sure that
-directory is on `PATH` for any MCP client that needs to launch `vds-mcp`.
+Cargo installs binaries to `%USERPROFILE%\.cargo\bin` on Windows and `~/.cargo/bin` on Unix. Make sure that directory is on `PATH` for any MCP client that needs to launch `vds-mcp`.
 
-## Run VDS Manually
+## Run the VDS 2 Server
 
-Start the stdio MCP server:
-
-```powershell
-vds-mcp --database E:\Dropbox\Projects\IBM\vds\.vds\vds.db serve
-```
-
-When `serve` starts, it announces itself on stderr with the service name, transport, capabilities, usage guidance, and
-advertised tool list. Stdout remains reserved for MCP protocol messages, so stdio clients can safely launch it.
-
-Start the streamable HTTP MCP server:
+**Stdio (recommended for MCP clients):**
 
 ```powershell
-vds-mcp --database E:\Dropbox\Projects\IBM\vds\.vds\vds.db server --bind 127.0.0.1:8001 --path /mcp
+vds-mcp --workspace E:\Projects\myproject serve-v2
 ```
 
-Use CLI document commands:
+**HTTP:**
 
 ```powershell
-vds-mcp --database E:\Dropbox\Projects\IBM\vds\.vds\vds.db import docs\overview.md
-vds-mcp --database E:\Dropbox\Projects\IBM\vds\.vds\vds.db list
-vds-mcp --database E:\Dropbox\Projects\IBM\vds\.vds\vds.db export <document_id> --output exported.md
+vds-mcp --workspace E:\Projects\myproject server-v2 --bind 127.0.0.1:8001 --path /mcp
 ```
 
-## Add VDS to an MCP Agent
+When `serve-v2` starts it announces itself on stderr (service name, transport, and tool list). Stdout is reserved for MCP messages. On first run it initializes `.vds/workspace.json` and the documents directory inside the workspace.
 
-Most stdio MCP clients use a server entry with a command and argument list. Add an entry named `vds` that runs the
-installed binary:
+## MCP Client Configuration
+
+### Claude Desktop / Cursor / Windsurf (JSON)
 
 ```json
 {
   "mcpServers": {
     "vds": {
       "command": "vds-mcp",
-      "args": [
-        "--database",
-        "E:\\Projects\\vds\\.vds\\vds.db",
-        "serve"
-      ]
+      "args": ["--workspace", "E:\\Projects\\myproject", "serve-v2"]
     }
   }
 }
 ```
 
-Use the same shape for clients such as Claude Desktop, Cursor, Windsurf, or other agents that accept MCP server JSON.
-Place the JSON in that client's MCP configuration file.
+Use an absolute workspace path. If `vds-mcp` is not on the MCP client's `PATH`, provide the full binary path:
 
-For Codex-style TOML configuration:
+```json
+{
+  "mcpServers": {
+    "vds": {
+      "command": "C:\\Users\\you\\.cargo\\bin\\vds-mcp.exe",
+      "args": ["--workspace", "E:\\Projects\\myproject", "serve-v2"]
+    }
+  }
+}
+```
+
+### Codex TOML
 
 ```toml
 [mcp_servers.vds]
-command = "vds"
-args = ["--database", "E:\\Projects\\vds\\.vds\\vds.db", "serve"]
+command = "vds-mcp"
+args = ["--workspace", "/absolute/path/to/project", "serve-v2"]
 ```
 
-If the MCP client requires an absolute command path, use the full path to the installed binary:
+### HTTP Clients
 
-```toml
-[mcp_servers.vds]
-command = "C:\\Users\\<you>\\.cargo\\bin\\vds.exe"
-args = ["--database", "E:\\Projects\\vds\\.vds\\vds.db", "serve"]
-```
-
-## HTTP MCP Configuration
-
-Some MCP clients connect to an HTTP endpoint instead of launching a stdio process. Start VDS yourself:
+Start the server separately and point the client at the configured URL:
 
 ```powershell
-vds-mcp --database E:\Projects\vds\.vds\vds.db server --bind 127.0.0.1:8001 --path /mcp
+vds-mcp --workspace E:\Projects\myproject server-v2 --bind 127.0.0.1:8001 --path /mcp
 ```
-
-Then configure the client URL as:
 
 ```text
 http://127.0.0.1:8001/mcp
 ```
 
-After initialization, clients discover VDS through the standard MCP `tools/list` capability and invoke operations with
-`tools/call`.
+## Workspace Initialization
 
-Use stdio unless the client specifically supports streamable HTTP MCP servers.
+VDS initializes the workspace on first use:
+
+```
+myproject/
+└── .vds/
+    └── workspace.json   ← created automatically
+```
+
+Existing Markdown files in the workspace are discovered immediately (subject to `.vdsignore`). They are not tracked by VDS until `manage_document_file` is called or a document is created through VDS tools.
+
+Add `.vds/` to `.gitignore` if you do not want to commit history — but committing `.vds/` is safe and useful for persistence across machines. The only file that should not be committed is the lock file (`vds.lock`), which is outside `.vds/`.
+
+## .vdsignore
+
+Create `.vdsignore` in the workspace root to exclude Markdown files from discovery:
+
+```
+# Exclude all files in the generated/ directory
+generated/
+
+# Re-include one specific file within that directory
+!generated/operator-guide.md
+
+# Exclude a specific file
+CONTRIBUTING.md
+```
+
+Patterns follow a subset of Gitignore syntax:
+- `pattern` — matches any file or directory component with that name
+- `dir/` — matches a directory and all its contents (trailing slash required)
+- `path/to/file.md` — matches a specific path from the workspace root (slash required to anchor)
+- `!pattern` — negates a previous match, re-including the path
+- `*`, `**`, `?` — standard glob wildcards
+
+`.gitignore` is not read automatically. Duplicate relevant lines into `.vdsignore` if needed.
+
+## Runtime Workspace Switching
+
+Use the `set_workspace` MCP tool to switch to a different workspace without restarting the server:
+
+```json
+{ "tool": "set_workspace", "arguments": { "workspace": "/path/to/other/project" } }
+```
+
+This flushes the current state, acquires a new workspace lease, rebuilds the in-memory index, and starts the filesystem watcher for the new location.
 
 ## Updating
 
@@ -136,3 +162,5 @@ Reinstall from Git:
 ```powershell
 cargo install --locked --git <repo-url> vds-mcp --force
 ```
+
+VDS 2 metadata format is versioned. The server will report `UnsupportedFormat` if an old `.vds/` directory uses a format it does not recognize. No automatic migration is performed; contact the project maintainer for migration guidance.

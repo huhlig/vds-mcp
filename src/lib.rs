@@ -49,7 +49,15 @@
 //! switch_document_version(document_id, version)
 
 pub mod document;
+#[cfg(feature = "semantic-search")]
+pub mod embedding_cache;
+pub mod filesystem_service;
 pub mod markdown;
 pub mod mcp;
+pub mod metadata;
+pub mod search;
+#[cfg(feature = "semantic-search")]
+pub mod semantic;
 pub mod service;
 pub mod storage;
+pub mod workspace;
