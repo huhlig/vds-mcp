@@ -17,16 +17,18 @@
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 use vds::markdown::{export_markdown_string, import_markdown_str};
 use vds::mcp::{
-    CreateDocumentParams, RenderDocumentMarkdownParams, SearchOptions, SearchSectionsParams,
-    VdsMcpSurface,
+    CreateDocumentParams, RenderDocumentMarkdownParams,
+    SearchOptions, SearchSectionsParams, VdsMcpSurface,
 };
+use vds::search::{FullTextIndex, FullTextSearchOptions};
 use vds::service::VdsServer;
 use vds::storage::DocumentStore;
+use vds::workspace::WorkspaceState;
 
 const OVERVIEW: &str = include_str!("../docs/overview.md");
 
@@ -65,7 +67,8 @@ fn bench_service_render_and_search() {
     let server = VdsServer::open(bench_db_path("service")).expect("open server");
     let document = server
         .create_document(CreateDocumentParams {
-            name: "overview".to_owned(),
+            relative_path: Some("overview.md".to_owned()),
+            name: Some("overview".to_owned()),
             title: None,
             initial_content: Some(OVERVIEW.to_owned()),
         })
@@ -97,7 +100,72 @@ fn bench_service_render_and_search() {
     });
 }
 
+fn bench_workspace_path(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let dir = std::env::current_dir()
+        .expect("current dir")
+        .join("target")
+        .join("bench-workspaces");
+    fs::create_dir_all(&dir).expect("bench workspace dir");
+    let workspace = dir.join(format!("{name}-{nonce}"));
+    fs::create_dir_all(&workspace).expect("create workspace");
+    workspace
+}
+
+fn bench_vds2_workspace_operations() {
+    let workspace = bench_workspace_path("vds2-ops");
+
+    // Create test markdown file
+    fs::write(workspace.join("overview.md"), OVERVIEW).expect("write overview");
+
+    measure("VDS 2.0 workspace load", 100, || {
+        let state = WorkspaceState::load(black_box(&workspace)).expect("load workspace");
+        black_box(state);
+    });
+
+    // Load once for subsequent operations
+    let state = WorkspaceState::load(&workspace).expect("load workspace");
+
+    measure("VDS 2.0 full-text index build", 100, || {
+        let index = FullTextIndex::build(black_box(&state));
+        black_box(index);
+    });
+
+    let index = FullTextIndex::build(&state);
+
+    measure("VDS 2.0 full-text search", 1000, || {
+        let results = index.search(
+            black_box("document filesystem"),
+            &FullTextSearchOptions::default(),
+        );
+        black_box(results);
+    });
+
+    measure("VDS 2.0 phrase search", 1000, || {
+        let results = index.search(
+            black_box("\"section tree\""),
+            &FullTextSearchOptions::default(),
+        );
+        black_box(results);
+    });
+
+    measure("VDS 2.0 prefix search", 1000, || {
+        let results = index.search(
+            black_box("document*"),
+            &FullTextSearchOptions::default(),
+        );
+        black_box(results);
+    });
+}
+
 fn main() {
+    println!("\n=== VDS 1.0 (Legacy) Benchmarks ===\n");
     bench_import_export();
     bench_service_render_and_search();
+
+    println!("\n=== VDS 2.0 (Filesystem) Benchmarks ===\n");
+    bench_vds2_workspace_operations();
 }
