@@ -44,19 +44,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the MCP server over stdio.
+    /// Start the filesystem-authoritative VDS server over stdio.
     Serve,
-    /// Start the filesystem-authoritative VDS 2 server over stdio.
-    ServeV2,
-    /// Start the MCP server over streamable HTTP (legacy VDS 1 database mode).
+    /// Start the legacy database-backed VDS 1 server over stdio (deprecated).
+    #[command(name = "serve-legacy", hide = true)]
+    ServeLegacy,
+    /// Start the filesystem-authoritative VDS server over streamable HTTP.
     Server {
         #[arg(long, default_value = "127.0.0.1:8001")]
         bind: String,
         #[arg(long, default_value = "/mcp")]
         path: String,
     },
-    /// Start the filesystem-authoritative VDS 2 server over streamable HTTP.
-    ServerV2 {
+    /// Legacy database-backed VDS 1 HTTP server (deprecated).
+    #[command(name = "server-legacy", hide = true)]
+    ServerLegacy {
         #[arg(long, default_value = "127.0.0.1:8001")]
         bind: String,
         #[arg(long, default_value = "/mcp")]
@@ -94,17 +96,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     match cli.command {
-        Command::Serve => vds::service::serve_stdio(database).await?,
-        Command::ServeV2 => {
+        Command::Serve => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
             vds::filesystem_service::serve_filesystem_stdio(workspace).await?
         }
+        Command::ServeLegacy => vds::service::serve_stdio(database).await?,
         Command::Server { bind, path } => {
-            vds::service::serve_streamable_http(database, bind, path).await?
-        }
-        Command::ServerV2 { bind, path } => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
             vds::filesystem_service::serve_filesystem_http(workspace, bind, path).await?
+        }
+        Command::ServerLegacy { bind, path } => {
+            vds::service::serve_streamable_http(database, bind, path).await?
         }
         Command::List => {
             let server = VdsServer::open(database)?;
@@ -176,13 +178,13 @@ metadata (`.vds/`) stores stable IDs, version history, and snapshots as Git-frie
   "mcpServers": {
     "vds": {
       "command": "vds-mcp",
-      "args": ["--workspace", "/absolute/path/to/project", "serve-v2"]
+      "args": ["--workspace", "/absolute/path/to/project", "serve"]
     }
   }
 }
 ```
 
-Use `serve-v2` (VDS 2.0 filesystem mode). `serve` is the legacy database-backed VDS 1 mode.
+Use `serve` for the filesystem-authoritative VDS 2 mode.
 
 ### Key Operations
 

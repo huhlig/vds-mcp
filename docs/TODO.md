@@ -163,35 +163,56 @@ the legacy service while section mutations remain database-only.
 
 ### Semantic Search
 
-**Platform constraint:** The `semantic-search` feature depends on `hnsw_vector_search`, which does not build on
-Windows. Before any semantic search work proceeds the following must happen:
+**Embedding runtime:** `hnsw_vector_search` bundles its own ONNX runtime and exposes `OnnxEmbedder` for
+inference. VDS does **not** need to vendor an ONNX runtime, but it must supply the model and tokenizer files:
 
-- [ ] Investigate whether `hnsw_vector_search` has a path to Windows support (upstream issue, alternative crate,
-      or vendored build script). If not, document Windows as an explicitly unsupported platform for this feature
-      and add a `cfg` guard or conditional compilation so `cargo build` on Windows never attempts to include it.
-- [ ] Add CI matrix entries that build `--features semantic-search` on Linux and macOS only, and verify that the
-      plain `cargo build` (no extra features) continues to pass on Windows.
-- [ ] Document in `README.md` and `docs/installation.md` that semantic search requires a Linux or macOS host and
-      is not available in the Windows binary.
+```rust
+// hnsw_vector_search::config::EmbeddingConfig
+pub struct EmbeddingConfig {
+    pub model_path: PathBuf,     // e.g. all-MiniLM-L6-v2.onnx
+    pub tokenizer_path: PathBuf, // e.g. tokenizer.json (HuggingFace format)
+    pub num_threads: usize,
+}
+```
+
+`OnnxEmbedder::embed(text) -> Vec<f32>` and `embed_batch(texts) -> Vec<Vec<f32>>` produce normalized vectors.
+
+**Current implementation gap:** `SemanticIndex` and `EmbeddingCache` are written and tested, but nothing in VDS
+currently instantiates `OnnxEmbedder` or populates `section.embedding`. The missing chain is:
+
+1. Accept model/tokenizer paths via config or CLI flag.
+2. On workspace load (or async after), call `OnnxEmbedder::embed(section_content)` for each section without a
+   cached embedding.
+3. Write the result into `EmbeddingCache` keyed by `(section_id, content_hash, model)`.
+4. Attach the vector to `MaterializedDocument.sections[*].embedding` before `SemanticIndex::build()` runs.
+
+**Platform constraint:** `hnsw_vector_search` does not build on Windows. All semantic search work must proceed
+on Linux or macOS.
+
+- [ ] Verify whether `hnsw_vector_search`'s bundled ONNX runtime has a Windows build path. If not, add a `cfg`
+      guard so `cargo build` on Windows never includes it, and document Windows as unsupported for this feature.
+- [ ] Add CI matrix entries that build `--features semantic-search` on Linux and macOS only.
+- [ ] Document in `README.md` and `docs/installation.md` that semantic search requires Linux or macOS.
 
 Once the platform constraint is resolved or documented, resume the following:
 
-- [ ] Build one semantic index per workspace generation instead of one index per query.
-- [ ] Generate or load embeddings asynchronously without blocking lexical search.
-- [ ] Key embeddings by content hash, title, model, tokenizer, and configuration version.
-- [ ] Store expensive derived embeddings outside the synchronized workspace.
-- [ ] Incrementally replace changed document vectors.
-- [ ] Expose semantic-index readiness separately from lexical-index readiness.
-- [ ] Implement semantic search in `serve-v2`.
+- [ ] Add `model_path` and `tokenizer_path` configuration (CLI flag or workspace config) for `OnnxEmbedder`.
+- [ ] Instantiate `OnnxEmbedder` in `FilesystemVdsServer` when the `semantic-search` feature is enabled.
+- [ ] On workspace load, generate embeddings for all sections not found in `EmbeddingCache`; attach vectors to
+      `MaterializedDocument` sections before `SemanticIndex::build()` runs.
+- [ ] Run embedding generation asynchronously so it does not block the initial lexical index.
+- [ ] Incrementally replace changed document vectors in `SemanticIndex` after mutation or watcher reload.
+- [ ] Expose semantic-index readiness separately from lexical-index readiness in `get_workspace`.
+- [ ] Implement `semantic_search` MCP operation in `serve`.
 - [ ] Define an explicit hybrid lexical/semantic fusion algorithm if hybrid search is added.
 
 ## Milestone 7: MCP and Transport Completion
 
-- [x] Provide an explicit `serve-v2` stdio mode.
+- [x] Provide a `serve` stdio mode for the filesystem-authoritative server.
 - [x] Expose implemented read and search operations without advertising unfinished mutations.
 - [x] Expose each section mutation only after its filesystem transaction is complete. All section mutations (`update_section`, `create_section`, `rename_section`, and the full structural set) are now advertised and backed by recoverable filesystem transactions.
-- [x] Expose history and snapshot operations after JSON-backed implementations exist. `section_versions`, `get_section_version`, `diff_section_versions`, `switch_section_version`, `create_document_snapshot`, `document_snapshots`, `diff_document_snapshots`, and `restore_document_snapshot` are all advertised in `serve-v2`.
-- [x] Replace the transitional `in-memory` database response with explicit cache/runtime information. `get_workspace` now returns `database: "filesystem"`, `watcher_active`, and `reload_count`. `get_database` also returns `"filesystem"` in `serve-v2` mode.
+- [x] Expose history and snapshot operations after JSON-backed implementations exist. `section_versions`, `get_section_version`, `diff_section_versions`, `switch_section_version`, `create_document_snapshot`, `document_snapshots`, `diff_document_snapshots`, and `restore_document_snapshot` are all advertised in `serve`.
+- [x] Replace the transitional `in-memory` database response with explicit cache/runtime information. `get_workspace` now returns `database: "filesystem"`, `watcher_active`, and `reload_count`.
 - [x] Add VDS 2 streamable HTTP serving. `serve-v2 --bind/--path` via the new `server-v2` CLI subcommand and `serve_filesystem_http` in `filesystem_service.rs`.
 - [x] Remove or redefine `set_database` in filesystem mode. `set_database` and `set_workspace` are not advertised by the VDS 2 server. `GetDatabase` description clarifies it returns `"filesystem"` in `serve-v2`. `SetDatabase` description notes it applies to legacy mode only.
 - [x] Add end-to-end MCP protocol tests for the VDS 2 server, not only direct trait calls. `tests/mcp_protocol.rs` exercises the JSON dispatch layer (`call()`) covering tool routing, argument deserialization, result serialization, error shapes, and the full mutation pipeline.
@@ -258,7 +279,7 @@ concrete need arises. Milestone removed from the release critical path.
 - [x] Every advertised MCP operation uses filesystem-authoritative behavior. `AVAILABLE_TOOL_NAMES` in `filesystem_service.rs` is the complete and accurate tool list for `serve-v2`. All tools dispatch to filesystem-backed handlers.
 - [x] Successful mutations survive process termination at every tested commit boundary. Failure injection tests in `metadata.rs` cover all `fail_point` locations in promotion, content mutation, structural mutation, soft deletion, and unmanage paths.
 - [x] External edits are never silently overwritten. Every mutation requires `expected_content_hash`; mismatches return `ExternalContentConflict` before any write is staged.
-- [x] Full-text and semantic indexes update coherently after local and external changes. Local mutations use `reload_incremental` (per-document index update). External changes trigger full `reload` via the watcher. Semantic search is feature-gated and not advertised in `serve-v2`.
+- [x] Full-text and semantic indexes update coherently after local and external changes. Local mutations use `reload_incremental` (per-document index update). External changes trigger full `reload` via the watcher. Semantic search is feature-gated and not advertised in `serve`.
 - [x] No live binary database is required inside the Git or Dropbox workspace. VDS 2 uses only JSON files. The `vds.lock` lease file is outside the workspace directory by design.
 - [x] Existing VDS 1 workspaces have a validated and reversible migration path. Milestone 8 deferred (no VDS 1 production workspaces exist). VDS 1 `serve` mode remains available. Acceptance criterion updated: not applicable for initial VDS 2 release.
 - [x] Installation, onboarding, and API documentation describe the implemented system accurately. `README.md`, `docs/overview.md`, `docs/installation.md`, and `src/bin.rs` onboarding content all updated for VDS 2.

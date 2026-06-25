@@ -159,8 +159,8 @@ impl WorkspaceGeneration {
 /// the old write lease before the new one is acquired.
 struct SwitchableState {
     workspace_root: PathBuf,
-    lease: WorkspaceLease,
-    watcher: Option<notify::RecommendedWatcher>,
+    _lease: WorkspaceLease,
+    _watcher: Option<notify::RecommendedWatcher>,
     watcher_active: bool,
 }
 
@@ -195,7 +195,7 @@ impl FilesystemVdsServer {
         let (watcher, watcher_active) = start_watcher(workspace_root.clone(), Arc::clone(&generation));
 
         Ok(Self {
-            switchable: Mutex::new(SwitchableState { workspace_root, lease, watcher, watcher_active }),
+            switchable: Mutex::new(SwitchableState { workspace_root, _lease: lease, _watcher: watcher, watcher_active }),
             generation,
             mutation_lock: Mutex::new(()),
         })
@@ -981,8 +981,8 @@ impl VdsMcpSurface for FilesystemVdsServer {
         // Replace switchable state; drop() releases old lease and stops old watcher thread.
         *self.switchable.lock().unwrap() = SwitchableState {
             workspace_root: canonical_root,
-            lease: new_lease,
-            watcher: new_watcher,
+            _lease: new_lease,
+            _watcher: new_watcher,
             watcher_active: new_watcher_active,
         };
 
