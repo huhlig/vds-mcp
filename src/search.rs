@@ -165,11 +165,20 @@ impl FullTextIndex {
         for atom in &atoms {
             match atom {
                 QueryAtom::Term { .. } => {
-                    self.score_term_atom(atom, options, normalized_prefix.as_deref(), &mut accumulators);
+                    self.score_term_atom(
+                        atom,
+                        options,
+                        normalized_prefix.as_deref(),
+                        &mut accumulators,
+                    );
                 }
                 QueryAtom::Phrase { terms, raw } => {
                     let phrase_matches = matched_phrase_keys(
-                        self, terms, raw, options, normalized_prefix.as_deref(),
+                        self,
+                        terms,
+                        raw,
+                        options,
+                        normalized_prefix.as_deref(),
                     );
                     if phrase_matches.is_empty() {
                         if options.require_all_terms {
@@ -188,7 +197,11 @@ impl FullTextIndex {
             }
         }
 
-        let required_matches = if options.require_all_terms { atoms.len() } else { 1 };
+        let required_matches = if options.require_all_terms {
+            atoms.len()
+        } else {
+            1
+        };
         let mut results = accumulators
             .into_iter()
             .filter(|(_, acc)| acc.matched_atoms >= required_matches)
@@ -253,9 +266,13 @@ impl FullTextIndex {
         let inv_df = idf(self.sections.len(), atom_df);
 
         for term in matching_terms {
-            let Some(postings) = self.postings.get(term) else { continue };
+            let Some(postings) = self.postings.get(term) else {
+                continue;
+            };
             for posting in postings {
-                let Some(section) = self.sections.get(&posting.key) else { continue };
+                let Some(section) = self.sections.get(&posting.key) else {
+                    continue;
+                };
                 if !matches_filters(&posting.key, section, options, path_prefix) {
                     continue;
                 }
@@ -272,7 +289,8 @@ impl FullTextIndex {
                 let m = atom_matches.entry(posting.key.clone()).or_default();
                 m.score += inv_df * (title_score + content_score);
                 m.title_match |= !posting.title_offsets.is_empty();
-                m.content_offsets.extend(posting.content_offsets.iter().copied());
+                m.content_offsets
+                    .extend(posting.content_offsets.iter().copied());
             }
         }
 
@@ -287,7 +305,10 @@ impl FullTextIndex {
 
     fn matching_terms<'a>(&'a self, atom: &QueryAtom) -> Vec<&'a String> {
         match atom {
-            QueryAtom::Term { term, prefix: false } => self
+            QueryAtom::Term {
+                term,
+                prefix: false,
+            } => self
                 .postings
                 .get_key_value(term.as_str())
                 .map(|(t, _)| vec![t])
@@ -355,10 +376,18 @@ impl FullTextIndex {
 
             let mut builders = BTreeMap::<String, PostingBuilder>::new();
             for token in title_tokens {
-                builders.entry(token.term).or_default().title_offsets.push((token.start, token.end));
+                builders
+                    .entry(token.term)
+                    .or_default()
+                    .title_offsets
+                    .push((token.start, token.end));
             }
             for token in content_tokens {
-                builders.entry(token.term).or_default().content_offsets.push((token.start, token.end));
+                builders
+                    .entry(token.term)
+                    .or_default()
+                    .content_offsets
+                    .push((token.start, token.end));
             }
             for (term, builder) in builders {
                 self.postings.entry(term).or_default().push(Posting {
@@ -429,23 +458,27 @@ fn matched_phrase_keys(
 
     let mut result = BTreeMap::new();
     for key in candidate_keys.into_iter().flatten() {
-        let Some(section) = index.sections.get(&key) else { continue };
+        let Some(section) = index.sections.get(&key) else {
+            continue;
+        };
         if !matches_filters(&key, section, options, path_prefix) {
             continue;
         }
         let lower_title = section.title.to_lowercase();
         let lower_content = section.content.to_lowercase();
-        let title_hit = lower_title.contains(raw.as_ref() as &str);
-        let content_hit = lower_content.contains(raw.as_ref() as &str);
+        let title_hit = lower_title.contains(raw as &str);
+        let content_hit = lower_content.contains(raw as &str);
         if !title_hit && !content_hit {
             continue;
         }
         // Score phrase matches with a fixed boost relative to individual terms.
         let phrase_score = if title_hit { 5.0 } else { 0.0 } + if content_hit { 2.0 } else { 0.0 };
-        let mut acc = SearchAccumulator::default();
-        acc.score = phrase_score;
-        acc.matched_atoms = 1;
-        acc.title_match = title_hit;
+        let acc = SearchAccumulator {
+            score: phrase_score,
+            matched_atoms: 1,
+            title_match: title_hit,
+            ..Default::default()
+        };
         result.insert(key, acc);
     }
     result
@@ -506,11 +539,17 @@ struct Token {
 /// an ordered phrase that must appear contiguously in the target text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum QueryAtom {
-    Term { term: String, prefix: bool },
+    Term {
+        term: String,
+        prefix: bool,
+    },
     /// Ordered sequence of lowercased terms that must appear as a contiguous
     /// run in title or content. `raw` is the lowercased, whitespace-normalised
     /// phrase string used for fast substring matching.
-    Phrase { terms: Vec<String>, raw: String },
+    Phrase {
+        terms: Vec<String>,
+        raw: String,
+    },
 }
 
 /// Parses a user query into a sequence of atoms.
@@ -565,7 +604,10 @@ fn flush_term_atoms(raw: &str, atoms: &mut Vec<QueryAtom>) {
         .strip_suffix('*')
         .map_or((raw, false), |value| (value, true));
     for token in tokenize(value) {
-        let atom = QueryAtom::Term { term: token.term, prefix };
+        let atom = QueryAtom::Term {
+            term: token.term,
+            prefix,
+        };
         if !atoms.contains(&atom) {
             atoms.push(atom);
         }
@@ -603,7 +645,11 @@ fn push_tokens(tokens: &mut Vec<Token>, text: &str, start: usize, end: usize) {
         return;
     }
     // Always emit the complete token lowercased.
-    tokens.push(Token { term: whole.clone(), start, end });
+    tokens.push(Token {
+        term: whole.clone(),
+        start,
+        end,
+    });
 
     // Additionally split camelCase / PascalCase / acronym boundaries and
     // emit sub-tokens so `camelCase` matches both `camel` and `case`.
@@ -632,7 +678,11 @@ fn camel_split_ranges(text: &str) -> Vec<(usize, usize)> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let n = chars.len();
     if n < 2 {
-        return if n == 0 { vec![] } else { vec![(0, text.len())] };
+        return if n == 0 {
+            vec![]
+        } else {
+            vec![(0, text.len())]
+        };
     }
 
     let mut splits: Vec<usize> = vec![0]; // segment start offsets
@@ -647,10 +697,12 @@ fn camel_split_ranges(text: &str) -> Vec<(usize, usize)> {
             }
             // Rule 2: uppercase-uppercase → lowercase (keep last upper with rest)
             // e.g. X M L P a r → split before P
-            else if ch.is_uppercase() && next_ch.is_uppercase() {
-                if i + 2 < n && chars[i + 2].1.is_lowercase() {
-                    splits.push(next_off);
-                }
+            else if ch.is_uppercase()
+                && next_ch.is_uppercase()
+                && i + 2 < n
+                && chars[i + 2].1.is_lowercase()
+            {
+                splits.push(next_off);
             }
         }
         i += 1;
@@ -795,9 +847,7 @@ mod tests {
         let results = index.search("storage filesystem", &FullTextSearchOptions::default());
 
         // Count actual sections from documents to understand the structure
-        let actual_section_count: usize = state.documents()
-            .map(|doc| doc.sections.len())
-            .sum();
+        let actual_section_count: usize = state.documents().map(|doc| doc.sections.len()).sum();
         assert_eq!(index.section_count(), actual_section_count);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].relative_path, "docs/architecture.md");
@@ -863,7 +913,10 @@ mod tests {
 
         // Searching component word "response"
         let r = index.search("response", &FullTextSearchOptions::default());
-        assert!(!r.is_empty(), "sub-word 'response' from camelCase must match");
+        assert!(
+            !r.is_empty(),
+            "sub-word 'response' from camelCase must match"
+        );
     }
 
     #[test]
@@ -877,10 +930,16 @@ mod tests {
         let index = FullTextIndex::build(&state);
 
         let r = index.search("document", &FullTextSearchOptions::default());
-        assert!(!r.is_empty(), "'document' from PascalCase DocumentStore must match");
+        assert!(
+            !r.is_empty(),
+            "'document' from PascalCase DocumentStore must match"
+        );
 
         let r = index.search("store", &FullTextSearchOptions::default());
-        assert!(!r.is_empty(), "'store' from PascalCase DocumentStore must match");
+        assert!(
+            !r.is_empty(),
+            "'store' from PascalCase DocumentStore must match"
+        );
     }
 
     #[test]
@@ -944,7 +1003,10 @@ mod tests {
 
         // Words in wrong order should not match as a phrase
         let r = index.search("\"brown quick\"", &FullTextSearchOptions::default());
-        assert!(r.is_empty(), "'brown quick' is not contiguous in that order");
+        assert!(
+            r.is_empty(),
+            "'brown quick' is not contiguous in that order"
+        );
     }
 
     #[test]
@@ -957,7 +1019,10 @@ mod tests {
         let state = WorkspaceState::load(&workspace.root).unwrap();
         let index = FullTextIndex::build(&state);
 
-        let r = index.search("\"filesystem authority\" durable", &FullTextSearchOptions::default());
+        let r = index.search(
+            "\"filesystem authority\" durable",
+            &FullTextSearchOptions::default(),
+        );
         assert!(!r.is_empty(), "phrase + term query should match");
     }
 
@@ -968,7 +1033,10 @@ mod tests {
         let state = WorkspaceState::load(&workspace.root).unwrap();
         let index = FullTextIndex::build(&state);
 
-        let r = index.search("\"nonexistent phrase xyz\"", &FullTextSearchOptions::default());
+        let r = index.search(
+            "\"nonexistent phrase xyz\"",
+            &FullTextSearchOptions::default(),
+        );
         assert!(r.is_empty(), "phrase not in any document must return empty");
     }
 
@@ -1000,23 +1068,34 @@ mod tests {
         index.remove_document(&doc_id);
 
         let after_remove = index.search("original", &FullTextSearchOptions::default());
-        assert!(after_remove.is_empty(), "should not match after remove_document");
+        assert!(
+            after_remove.is_empty(),
+            "should not match after remove_document"
+        );
 
         // Simulate a changed document by writing new content and reloading.
         workspace.write("doc.md", "# Doc\n\nUpdated content here.\n");
         let new_state = WorkspaceState::load(&workspace.root).unwrap();
         let new_doc = new_state.document_by_path("doc.md").unwrap();
-        let new_sections_by_id = new_doc.sections.iter()
+        let new_sections_by_id = new_doc
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s))
             .collect::<BTreeMap<_, _>>();
 
         index.add_document(new_doc, &new_sections_by_id);
 
         let after_add = index.search("updated", &FullTextSearchOptions::default());
-        assert!(!after_add.is_empty(), "should match new content after add_document");
+        assert!(
+            !after_add.is_empty(),
+            "should match new content after add_document"
+        );
 
         // Old content must be gone.
         let old_term = index.search("original", &FullTextSearchOptions::default());
-        assert!(old_term.is_empty(), "old postings must not remain after add_document");
+        assert!(
+            old_term.is_empty(),
+            "old postings must not remain after add_document"
+        );
     }
 }

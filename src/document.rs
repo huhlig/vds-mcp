@@ -505,6 +505,7 @@ fn normalize_patch_op_kind(kind: &str) -> String {
 /// Options that describe and guard an edit operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct EditOptions {
     /// Version the caller believes is current, used for optimistic concurrency.
     pub expected_version: Option<VersionId>,
@@ -512,16 +513,6 @@ pub struct EditOptions {
     pub author: Option<String>,
     /// Optional human-readable description of the edit.
     pub change_summary: Option<String>,
-}
-
-impl Default for EditOptions {
-    fn default() -> Self {
-        Self {
-            expected_version: None,
-            author: None,
-            change_summary: None,
-        }
-    }
 }
 
 /// Validation message produced while checking document integrity.

@@ -437,7 +437,9 @@ impl MetadataRepository {
             created_at: Utc::now(),
         };
         write_json_create_new(&transaction_root.join("intent.json"), &promotion_intent)
-            .map_err(|e| { let _ = fs::remove_dir_all(&transaction_root); e })?;
+            .inspect_err(|_e| {
+                let _ = fs::remove_dir_all(&transaction_root);
+            })?;
 
         let stage_result = (|| {
             write_json_create_new(&staged_document.join("document.json"), &document_record)?;
@@ -515,8 +517,12 @@ impl MetadataRepository {
             let envelope: TransactionEnvelope = read_json(&intent_path)?;
             match envelope.transaction_kind.as_str() {
                 "relocation" | "" => self.recover_relocation(&transaction_root)?,
-                "content_mutation" => self.recover_content_mutation_on_restart(&transaction_root)?,
-                "structural_mutation" => self.recover_structural_mutation_on_restart(&transaction_root)?,
+                "content_mutation" => {
+                    self.recover_content_mutation_on_restart(&transaction_root)?
+                }
+                "structural_mutation" => {
+                    self.recover_structural_mutation_on_restart(&transaction_root)?
+                }
                 "promotion" => self.recover_promotion(&transaction_root)?,
                 "soft_deletion" => self.recover_soft_deletion(&transaction_root)?,
                 kind => {
@@ -557,8 +563,8 @@ impl MetadataRepository {
         if source_relative_path == destination_relative_path {
             return Err(MetadataError::SameDocumentPath(source_relative_path));
         }
-        let is_case_only_rename = cfg!(windows)
-            && source_relative_path.eq_ignore_ascii_case(destination_relative_path);
+        let is_case_only_rename =
+            cfg!(windows) && source_relative_path.eq_ignore_ascii_case(destination_relative_path);
         // Case-only renames are handled below via an intermediate temp path.
 
         let source = self
@@ -622,10 +628,8 @@ impl MetadataRepository {
             // name in the same directory to force the casing update.
             let temp_name = format!("~vds-rename-{}.md", &intent.transaction_id[..8]);
             let temp_path = destination_parent.join(&temp_name);
-            fs::rename(&source, &temp_path)
-                .map_err(|e| MetadataError::io(&temp_path, e))?;
-            fs::rename(&temp_path, &destination)
-                .map_err(|e| MetadataError::io(&destination, e))?;
+            fs::rename(&source, &temp_path).map_err(|e| MetadataError::io(&temp_path, e))?;
+            fs::rename(&temp_path, &destination).map_err(|e| MetadataError::io(&destination, e))?;
         } else {
             fs::rename(&source, &destination)
                 .map_err(|source| MetadataError::io(&destination, source))?;
@@ -641,14 +645,15 @@ impl MetadataRepository {
         // Remove the source parent directory if it is now empty and is not the
         // workspace root. Only one level is cleaned: VDS creates single-level
         // directories and we do not want to silently remove nested user directories.
-        if let Some(source_parent) = source.parent() {
-            if source_parent != self.workspace_root
-                && source_parent != destination_parent
-                && source_parent.is_dir()
-                && source_parent.read_dir().map_or(false, |mut d| d.next().is_none())
-            {
-                let _ = fs::remove_dir(source_parent);
-            }
+        if let Some(source_parent) = source.parent()
+            && source_parent != self.workspace_root
+            && source_parent != destination_parent
+            && source_parent.is_dir()
+            && source_parent
+                .read_dir()
+                .is_ok_and(|mut d| d.next().is_none())
+        {
+            let _ = fs::remove_dir(source_parent);
         }
 
         Ok(RelocationResult {
@@ -691,8 +696,7 @@ impl MetadataRepository {
         let transaction_id = Uuid::now_v7().to_string();
         let transaction_root = self.recovery_root().join(&transaction_id);
         let staged = transaction_root.join("staged");
-        fs::create_dir_all(&staged)
-            .map_err(|source| MetadataError::io(&staged, source))?;
+        fs::create_dir_all(&staged).map_err(|source| MetadataError::io(&staged, source))?;
 
         let intent = ContentMutationIntent {
             format_version: METADATA_FORMAT_VERSION,
@@ -713,19 +717,28 @@ impl MetadataRepository {
         write_json_create_new(&version_path, new_section_version)?;
         fail_point()?;
 
-        let markdown_path = self.workspace_root.join(path_from_vds(&intent.relative_path));
+        let markdown_path = self
+            .workspace_root
+            .join(path_from_vds(&intent.relative_path));
         let original_markdown = fs::read_to_string(&markdown_path).unwrap_or_default();
-        write_bytes_create_new(&staged.join("original_markdown"), original_markdown.as_bytes())?;
+        write_bytes_create_new(
+            &staged.join("original_markdown"),
+            original_markdown.as_bytes(),
+        )?;
         write_bytes_create_new(&staged.join("markdown"), new_markdown.as_bytes())?;
         fail_point()?;
 
         write_json_create_new(
-            &staged.join(format!("section-{}.json", updated_section_record.section_id.as_str())),
+            &staged.join(format!(
+                "section-{}.json",
+                updated_section_record.section_id.as_str()
+            )),
             updated_section_record,
         )?;
         fail_point()?;
 
-        let result = self.apply_content_mutation(&transaction_root, &intent, updated_section_record);
+        let result =
+            self.apply_content_mutation(&transaction_root, &intent, updated_section_record);
         if result.is_err() {
             self.rollback_content_mutation(&transaction_root);
         }
@@ -761,8 +774,7 @@ impl MetadataRepository {
         let transaction_id = Uuid::now_v7().to_string();
         let transaction_root = self.recovery_root().join(&transaction_id);
         let staged = transaction_root.join("staged");
-        fs::create_dir_all(&staged)
-            .map_err(|source| MetadataError::io(&staged, source))?;
+        fs::create_dir_all(&staged).map_err(|source| MetadataError::io(&staged, source))?;
 
         let dummy_section_id = SectionId::new("structural");
         let intent = ContentMutationIntent {
@@ -786,9 +798,14 @@ impl MetadataRepository {
         }
         fail_point()?;
 
-        let markdown_path = self.workspace_root.join(path_from_vds(&intent.relative_path));
+        let markdown_path = self
+            .workspace_root
+            .join(path_from_vds(&intent.relative_path));
         let original_markdown = fs::read_to_string(&markdown_path).unwrap_or_default();
-        write_bytes_create_new(&staged.join("original_markdown"), original_markdown.as_bytes())?;
+        write_bytes_create_new(
+            &staged.join("original_markdown"),
+            original_markdown.as_bytes(),
+        )?;
         write_bytes_create_new(&staged.join("markdown"), new_markdown.as_bytes())?;
         fail_point()?;
 
@@ -806,8 +823,13 @@ impl MetadataRepository {
         }
         fail_point()?;
 
-        self.apply_structural_mutation(&transaction_root, &intent, updated_current, updated_section_records)
-            .map(|()| new_content_hash)
+        self.apply_structural_mutation(
+            &transaction_root,
+            &intent,
+            updated_current,
+            updated_section_records,
+        )
+        .map(|()| new_content_hash)
     }
 
     /// Updates section metadata in `.vds` JSON without modifying the Markdown
@@ -818,14 +840,14 @@ impl MetadataRepository {
         updated_section_record: &SectionRecord,
         updated_current: &CurrentDocumentRecord,
     ) -> Result<()> {
-        let document_root = self
-            .documents_root()
-            .join(document_id.as_str());
+        let document_root = self.documents_root().join(document_id.as_str());
         if !document_root.exists() {
             return Err(MetadataError::DocumentNotManaged(document_id.clone()));
         }
         let section_id = &updated_section_record.section_id;
-        let section_path = document_root.join("sections").join(format!("{}.json", section_id.as_str()));
+        let section_path = document_root
+            .join("sections")
+            .join(format!("{}.json", section_id.as_str()));
         let current_path = document_root.join("current.json");
 
         overwrite_json(&section_path, updated_section_record)?;
@@ -844,11 +866,15 @@ impl MetadataRepository {
         validate_relative_path(relative_path)?;
         let catalog = self.load_catalog()?;
         if catalog.document_by_path(relative_path).is_some() {
-            return Err(MetadataError::DocumentPathAlreadyManaged(relative_path.to_owned()));
+            return Err(MetadataError::DocumentPathAlreadyManaged(
+                relative_path.to_owned(),
+            ));
         }
         let dest_path = self.workspace_root.join(path_from_vds(relative_path));
         if dest_path.exists() {
-            return Err(MetadataError::DocumentPathAlreadyManaged(relative_path.to_owned()));
+            return Err(MetadataError::DocumentPathAlreadyManaged(
+                relative_path.to_owned(),
+            ));
         }
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).map_err(|source| MetadataError::io(parent, source))?;
@@ -894,7 +920,9 @@ impl MetadataRepository {
         let current_hash = &managed.current.content_hash;
         if current_hash != expected_content_hash {
             return Err(MetadataError::ContentHashConflict {
-                path: self.workspace_root.join(path_from_vds(&managed.document.relative_path)),
+                path: self
+                    .workspace_root
+                    .join(path_from_vds(&managed.document.relative_path)),
                 expected: expected_content_hash.to_owned(),
                 actual: current_hash.clone(),
             });
@@ -916,8 +944,11 @@ impl MetadataRepository {
             content_hash: current_hash.clone(),
             created_at: Utc::now(),
         };
-        write_json_create_new(&transaction_root.join("intent.json"), &intent)
-            .map_err(|e| { let _ = fs::remove_dir_all(&transaction_root); e })?;
+        write_json_create_new(&transaction_root.join("intent.json"), &intent).inspect_err(
+            |_e| {
+                let _ = fs::remove_dir_all(&transaction_root);
+            },
+        )?;
 
         let result = self.execute_remove_document_file(document_id, &previous_path, current_hash);
         if result.is_ok() {
@@ -994,14 +1025,20 @@ impl MetadataRepository {
         let current_hash = &managed.current.content_hash;
         if current_hash != expected_content_hash {
             return Err(MetadataError::ContentHashConflict {
-                path: self.workspace_root.join(path_from_vds(&managed.document.relative_path)),
+                path: self
+                    .workspace_root
+                    .join(path_from_vds(&managed.document.relative_path)),
                 expected: expected_content_hash.to_owned(),
                 actual: current_hash.clone(),
             });
         }
 
         let previous_path = managed.document.relative_path.clone();
-        let sub_kind = if archive_history { "unmanage_archive" } else { "unmanage_drop" };
+        let sub_kind = if archive_history {
+            "unmanage_archive"
+        } else {
+            "unmanage_drop"
+        };
         let transaction_id = Uuid::now_v7().to_string();
         let transaction_root = self.recovery_root().join(&transaction_id);
         fs::create_dir_all(&transaction_root)
@@ -1017,10 +1054,18 @@ impl MetadataRepository {
             content_hash: current_hash.clone(),
             created_at: Utc::now(),
         };
-        write_json_create_new(&transaction_root.join("intent.json"), &intent)
-            .map_err(|e| { let _ = fs::remove_dir_all(&transaction_root); e })?;
+        write_json_create_new(&transaction_root.join("intent.json"), &intent).inspect_err(
+            |_e| {
+                let _ = fs::remove_dir_all(&transaction_root);
+            },
+        )?;
 
-        let result = self.execute_unmanage_document_file(document_id, &previous_path, current_hash, archive_history);
+        let result = self.execute_unmanage_document_file(
+            document_id,
+            &previous_path,
+            current_hash,
+            archive_history,
+        );
         if result.is_ok() {
             let _ = fs::remove_dir_all(&transaction_root);
         }
@@ -1133,9 +1178,7 @@ impl MetadataRepository {
             return Ok(Vec::new());
         }
         let mut ids = Vec::new();
-        for entry in
-            fs::read_dir(&version_dir).map_err(|e| MetadataError::io(&version_dir, e))?
-        {
+        for entry in fs::read_dir(&version_dir).map_err(|e| MetadataError::io(&version_dir, e))? {
             let entry = entry.map_err(|e| MetadataError::io(&version_dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Some(stem) = name.strip_suffix(".json") {
@@ -1186,8 +1229,7 @@ impl MetadataRepository {
             return Err(MetadataError::DocumentNotManaged(document_id.clone()));
         }
         let snapshots_dir = document_root.join("snapshots");
-        fs::create_dir_all(&snapshots_dir)
-            .map_err(|e| MetadataError::io(&snapshots_dir, e))?;
+        fs::create_dir_all(&snapshots_dir).map_err(|e| MetadataError::io(&snapshots_dir, e))?;
         let snapshot_id = SnapshotId::new_v7();
         let snapshot = DocumentSnapshot {
             snapshot_id: snapshot_id.clone(),
@@ -1303,8 +1345,7 @@ impl MetadataRepository {
                 )));
             }
             if let Some(parent) = restore_abs.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|source| MetadataError::io(parent, source))?;
+                fs::create_dir_all(parent).map_err(|source| MetadataError::io(parent, source))?;
             }
             fs::copy(&archived_content, &restore_abs)
                 .map_err(|source| MetadataError::io(&restore_abs, source))?;
@@ -1393,7 +1434,9 @@ impl MetadataRepository {
             written_hash = intent.new_content_hash.clone();
         }
 
-        let version_dir = document_root.join("versions").join(intent.section_id.as_str());
+        let version_dir = document_root
+            .join("versions")
+            .join(intent.section_id.as_str());
         fs::create_dir_all(&version_dir)
             .map_err(|source| MetadataError::io(&version_dir, source))?;
         for entry in fs::read_dir(&staged).map_err(|source| MetadataError::io(&staged, source))? {
@@ -1408,7 +1451,9 @@ impl MetadataRepository {
             }
         }
 
-        let section_path = document_root.join("sections").join(format!("{}.json", intent.section_id.as_str()));
+        let section_path = document_root
+            .join("sections")
+            .join(format!("{}.json", intent.section_id.as_str()));
         overwrite_json(&section_path, updated_section_record)?;
 
         let current_path = document_root.join("current.json");
@@ -1460,8 +1505,8 @@ impl MetadataRepository {
         if staged_markdown.exists() {
             let staged_hash = sha256(&fs::read(&staged_markdown).unwrap_or_default());
             if staged_hash == intent.new_content_hash {
-                let section_record_path = staged
-                    .join(format!("section-{}.json", intent.section_id.as_str()));
+                let section_record_path =
+                    staged.join(format!("section-{}.json", intent.section_id.as_str()));
                 if section_record_path.exists() {
                     let section_record: SectionRecord = read_json(&section_record_path)?;
                     return self.apply_content_mutation(transaction_root, &intent, &section_record);
@@ -1503,7 +1548,8 @@ impl MetadataRepository {
                     for entry in fs::read_dir(&staged_sections_dir)
                         .map_err(|source| MetadataError::io(&staged_sections_dir, source))?
                     {
-                        let entry = entry.map_err(|source| MetadataError::io(&staged_sections_dir, source))?;
+                        let entry = entry
+                            .map_err(|source| MetadataError::io(&staged_sections_dir, source))?;
                         if entry.file_name().to_string_lossy().ends_with(".json") {
                             section_records.push(read_json(&entry.path())?);
                         }
@@ -1530,7 +1576,8 @@ impl MetadataRepository {
                     for entry in fs::read_dir(&staged_sections_dir)
                         .map_err(|source| MetadataError::io(&staged_sections_dir, source))?
                     {
-                        let entry = entry.map_err(|source| MetadataError::io(&staged_sections_dir, source))?;
+                        let entry = entry
+                            .map_err(|source| MetadataError::io(&staged_sections_dir, source))?;
                         if entry.file_name().to_string_lossy().ends_with(".json") {
                             section_records.push(read_json(&entry.path())?);
                         }
@@ -1619,7 +1666,9 @@ impl MetadataRepository {
         let sections_dir = document_root.join("sections");
         let staged_sections = staged.join("sections");
         if staged_sections.exists() {
-            for entry in fs::read_dir(&staged_sections).map_err(|source| MetadataError::io(&staged_sections, source))? {
+            for entry in fs::read_dir(&staged_sections)
+                .map_err(|source| MetadataError::io(&staged_sections, source))?
+            {
                 let entry = entry.map_err(|source| MetadataError::io(&staged_sections, source))?;
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.ends_with(".json") {
@@ -1951,7 +2000,7 @@ fn validate_format(format_version: u32, path: impl Into<PathBuf>) -> Result<()> 
 }
 
 fn sha256(contents: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(contents))
+    format!("sha256:{}", hex::encode(Sha256::digest(contents)))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -2208,13 +2257,21 @@ impl fmt::Display for MetadataError {
                 "cannot recover relocation at {}: source_exists={source_exists}, destination_exists={destination_exists}",
                 transaction.display()
             ),
-            Self::SectionNotManaged { document_id, section_id } => write!(
+            Self::SectionNotManaged {
+                document_id,
+                section_id,
+            } => write!(
                 formatter,
                 "section {} is not managed in document {}",
                 section_id.as_str(),
                 document_id.as_str()
             ),
-            Self::ExternalContentConflict { document_id, path, expected_hash, actual_hash } => write!(
+            Self::ExternalContentConflict {
+                document_id,
+                path,
+                expected_hash,
+                actual_hash,
+            } => write!(
                 formatter,
                 "external edit detected on {} (document {}): expected {expected_hash}, found {actual_hash}; reload the document and retry",
                 path.display(),
@@ -2252,13 +2309,19 @@ pub enum LeaseError {
 impl fmt::Display for LeaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyHeld { lock_path, incumbent_pid: Some(pid) } => write!(
+            Self::AlreadyHeld {
+                lock_path,
+                incumbent_pid: Some(pid),
+            } => write!(
                 f,
                 "another VDS writer (PID {pid}) holds the workspace lease at {}; \
                  if that process is no longer running, delete the lock file and retry",
                 lock_path.display()
             ),
-            Self::AlreadyHeld { lock_path, incumbent_pid: None } => write!(
+            Self::AlreadyHeld {
+                lock_path,
+                incumbent_pid: None,
+            } => write!(
                 f,
                 "another VDS writer holds the workspace lease at {}; \
                  if no VDS process is running, delete the lock file and retry",
@@ -2314,7 +2377,10 @@ impl WorkspaceLease {
                 let incumbent_pid = fs::read_to_string(&lock_path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok());
-                Err(LeaseError::AlreadyHeld { lock_path, incumbent_pid })
+                Err(LeaseError::AlreadyHeld {
+                    lock_path,
+                    incumbent_pid,
+                })
             }
             Err(e) => Err(LeaseError::Io(e)),
         }
@@ -2559,7 +2625,12 @@ mod tests {
         fs::create_dir_all(&staged).unwrap();
 
         let version_id = VersionId::new("v-recovery-test");
-        let meta = SectionMetadata { anchor: None, tags: vec![], summary: None, locked: false };
+        let meta = SectionMetadata {
+            anchor: None,
+            tags: vec![],
+            summary: None,
+            locked: false,
+        };
         let version = SectionVersion {
             version_id: version_id.clone(),
             section_id: section_id.clone(),
@@ -2594,12 +2665,17 @@ mod tests {
             created_at: Utc::now(),
         };
         write_json_create_new(&transaction_root.join("intent.json"), &intent).unwrap();
-        write_json_create_new(&staged.join(format!("{}.json", version_id.as_str())), &version).unwrap();
+        write_json_create_new(
+            &staged.join(format!("{}.json", version_id.as_str())),
+            &version,
+        )
+        .unwrap();
         write_bytes_create_new(&staged.join("markdown"), new_content.as_bytes()).unwrap();
         write_json_create_new(
             &staged.join(format!("section-{}.json", section_id.as_str())),
             &updated_section_record,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Simulate crash before markdown was written — disk still has original content.
         repository.recover_transactions().unwrap();
@@ -2699,7 +2775,10 @@ mod tests {
         repository.recover_transactions().unwrap();
 
         let final_root = workspace.root.join(".vds/documents").join(doc_id.as_str());
-        assert!(final_root.exists(), "document directory should exist after recovery");
+        assert!(
+            final_root.exists(),
+            "document directory should exist after recovery"
+        );
         assert!(final_root.join("document.json").exists());
         assert!(!transaction_root.exists());
     }
@@ -2721,7 +2800,10 @@ mod tests {
         // After dropping the first lease the lock file is removed; a new
         // acquisition on the same path must succeed.
         let third = WorkspaceLease::acquire(&canonical);
-        assert!(third.is_ok(), "lease should be re-acquirable after previous holder drops it");
+        assert!(
+            third.is_ok(),
+            "lease should be re-acquirable after previous holder drops it"
+        );
     }
 
     #[test]
@@ -2775,7 +2857,8 @@ mod tests {
         write_json_create_new(
             &staged.join(format!("section-{}.json", section_id.as_str())),
             &section_record,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = repository.recover_transactions();
         assert!(
@@ -2834,9 +2917,15 @@ mod tests {
 
         repository.recover_transactions().unwrap();
 
-        assert!(!workspace.root.join("report.md").exists(), "markdown should be deleted");
+        assert!(
+            !workspace.root.join("report.md").exists(),
+            "markdown should be deleted"
+        );
         assert!(!transaction_root.exists(), "recovery dir should be removed");
-        assert!(inactive_dir.join("archive/metadata").exists(), "archive should remain");
+        assert!(
+            inactive_dir.join("archive/metadata").exists(),
+            "archive should remain"
+        );
     }
 
     #[test]
@@ -2884,10 +2973,19 @@ mod tests {
         repository.recover_transactions().unwrap();
 
         // Markdown must still be on disk; metadata must be in archive.
-        assert!(workspace.root.join("notes.md").exists(), "markdown should be preserved");
+        assert!(
+            workspace.root.join("notes.md").exists(),
+            "markdown should be preserved"
+        );
         let document_root = workspace.root.join(".vds/documents").join(doc_id.as_str());
-        assert!(!document_root.exists(), "active document dir should be gone");
-        assert!(inactive_dir.join("archive/metadata").exists(), "archive should contain metadata");
+        assert!(
+            !document_root.exists(),
+            "active document dir should be gone"
+        );
+        assert!(
+            inactive_dir.join("archive/metadata").exists(),
+            "archive should contain metadata"
+        );
         assert!(!transaction_root.exists());
     }
 
@@ -2916,7 +3014,8 @@ mod tests {
             let recovery_root = workspace.root.join(".vds/recovery");
             if recovery_root.exists() {
                 assert_eq!(
-                    fs::read_dir(&recovery_root).unwrap().count(), 0,
+                    fs::read_dir(&recovery_root).unwrap().count(),
+                    0,
                     "orphaned transaction at promote step {step}"
                 );
             }
@@ -2952,7 +3051,12 @@ mod tests {
             let original_hash = promoted.current.content_hash.clone();
 
             let version_id = VersionId::new("v-inject");
-            let meta = SectionMetadata { anchor: None, tags: vec![], summary: None, locked: false };
+            let meta = SectionMetadata {
+                anchor: None,
+                tags: vec![],
+                summary: None,
+                locked: false,
+            };
             let version = SectionVersion {
                 version_id: version_id.clone(),
                 section_id: section_id.clone(),
@@ -2992,14 +3096,17 @@ mod tests {
             let recovery_root = workspace.root.join(".vds/recovery");
             if recovery_root.exists() {
                 assert_eq!(
-                    fs::read_dir(&recovery_root).unwrap().count(), 0,
+                    fs::read_dir(&recovery_root).unwrap().count(),
+                    0,
                     "orphaned transaction at content-mutation step {step}"
                 );
             }
 
             // Disk and catalog must agree on hash — the key invariant.
             let catalog = repo2.load_catalog().unwrap();
-            let managed = catalog.document_by_id(&promoted.document.document_id).unwrap();
+            let managed = catalog
+                .document_by_id(&promoted.document.document_id)
+                .unwrap();
             let disk = fs::read_to_string(workspace.root.join("notes.md")).unwrap();
             let disk_hash = sha256(disk.as_bytes());
             assert_eq!(
@@ -3040,7 +3147,12 @@ mod tests {
         fs::create_dir_all(&staged).unwrap();
 
         let version_id = VersionId::new("v-after-rename");
-        let meta = SectionMetadata { anchor: None, tags: vec![], summary: None, locked: false };
+        let meta = SectionMetadata {
+            anchor: None,
+            tags: vec![],
+            summary: None,
+            locked: false,
+        };
         let version = SectionVersion {
             version_id: version_id.clone(),
             section_id: section_id.clone(),
@@ -3077,11 +3189,13 @@ mod tests {
         write_json_create_new(
             &staged.join(format!("{}.json", version_id.as_str())),
             &version,
-        ).unwrap();
+        )
+        .unwrap();
         write_json_create_new(
             &staged.join(format!("section-{}.json", section_id.as_str())),
             &updated_record,
-        ).unwrap();
+        )
+        .unwrap();
         write_bytes_create_new(&staged.join("markdown"), new_content.as_bytes()).unwrap();
 
         // Simulate: markdown was already renamed to new content before crash.
@@ -3091,14 +3205,22 @@ mod tests {
 
         // Metadata must now reflect the new content.
         let catalog = repository.load_catalog().unwrap();
-        let managed = catalog.document_by_id(&promoted.document.document_id).unwrap();
-        assert_eq!(managed.current.content_hash, new_hash, "current.json should reflect new hash");
+        let managed = catalog
+            .document_by_id(&promoted.document.document_id)
+            .unwrap();
+        assert_eq!(
+            managed.current.content_hash, new_hash,
+            "current.json should reflect new hash"
+        );
         assert_eq!(
             managed.sections.get(&section_id).unwrap().current_version,
             version_id,
             "section record should point to new version"
         );
-        assert!(!transaction_root.exists(), "transaction dir should be cleaned up");
+        assert!(
+            !transaction_root.exists(),
+            "transaction dir should be cleaned up"
+        );
     }
 
     #[test]
@@ -3130,7 +3252,8 @@ mod tests {
             let recovery_root = workspace.root.join(".vds/recovery");
             if recovery_root.exists() {
                 assert_eq!(
-                    fs::read_dir(&recovery_root).unwrap().count(), 0,
+                    fs::read_dir(&recovery_root).unwrap().count(),
+                    0,
                     "orphaned transaction at soft-deletion step {step}"
                 );
             }
@@ -3157,9 +3280,9 @@ mod tests {
 
         // Our mutation edits line A; an external edit changes line C independently.
         // diffy should merge them cleanly without conflict markers.
-        let original     = "# Doc\n\nLine A.\nLine B.\nLine C.\n";
-        let externally   = "# Doc\n\nLine A.\nLine B.\nLine C (external).\n";
-        let ours         = "# Doc\n\nLine A (ours).\nLine B.\nLine C.\n";
+        let original = "# Doc\n\nLine A.\nLine B.\nLine C.\n";
+        let externally = "# Doc\n\nLine A.\nLine B.\nLine C (external).\n";
+        let ours = "# Doc\n\nLine A (ours).\nLine B.\nLine C.\n";
         // Expected: both edits present
         let expected_merged = "# Doc\n\nLine A (ours).\nLine B.\nLine C (external).\n";
 
@@ -3179,7 +3302,12 @@ mod tests {
         fs::create_dir_all(&staged).unwrap();
 
         let version_id = VersionId::new("v-merge");
-        let meta = SectionMetadata { anchor: None, tags: vec![], summary: None, locked: false };
+        let meta = SectionMetadata {
+            anchor: None,
+            tags: vec![],
+            summary: None,
+            locked: false,
+        };
         let version = SectionVersion {
             version_id: version_id.clone(),
             section_id: section_id.clone(),
@@ -3216,13 +3344,15 @@ mod tests {
         write_json_create_new(
             &staged.join(format!("{}.json", version_id.as_str())),
             &version,
-        ).unwrap();
+        )
+        .unwrap();
         write_bytes_create_new(&staged.join("original_markdown"), original.as_bytes()).unwrap();
         write_bytes_create_new(&staged.join("markdown"), ours.as_bytes()).unwrap();
         write_json_create_new(
             &staged.join(format!("section-{}.json", section_id.as_str())),
             &updated_record,
-        ).unwrap();
+        )
+        .unwrap();
 
         // External edit to a non-overlapping line.
         workspace.write("doc.md", externally);
@@ -3230,13 +3360,24 @@ mod tests {
         repository.recover_transactions().unwrap();
 
         let disk = workspace.read("doc.md");
-        assert_eq!(disk, expected_merged, "three-way merge should produce merged content");
+        assert_eq!(
+            disk, expected_merged,
+            "three-way merge should produce merged content"
+        );
 
         let catalog = repository.load_catalog().unwrap();
-        let managed = catalog.document_by_id(&promoted.document.document_id).unwrap();
+        let managed = catalog
+            .document_by_id(&promoted.document.document_id)
+            .unwrap();
         let merged_hash = sha256(expected_merged.as_bytes());
-        assert_eq!(managed.current.content_hash, merged_hash, "catalog should reflect merged hash");
-        assert!(!transaction_root.exists(), "transaction dir should be cleaned up after merge");
+        assert_eq!(
+            managed.current.content_hash, merged_hash,
+            "catalog should reflect merged hash"
+        );
+        assert!(
+            !transaction_root.exists(),
+            "transaction dir should be cleaned up after merge"
+        );
     }
 
     #[test]
@@ -3244,9 +3385,9 @@ mod tests {
         use crate::document::{SectionMetadata, VersionId};
 
         // Both our mutation and the external edit change the same line — conflict.
-        let original   = "# Doc\n\nThe line.\n";
+        let original = "# Doc\n\nThe line.\n";
         let externally = "# Doc\n\nThe line (external).\n";
-        let ours       = "# Doc\n\nThe line (ours).\n";
+        let ours = "# Doc\n\nThe line (ours).\n";
 
         let workspace = TestWorkspace::new("three-way-conflict");
         workspace.write("doc.md", original);
@@ -3264,7 +3405,12 @@ mod tests {
         fs::create_dir_all(&staged).unwrap();
 
         let version_id = VersionId::new("v-conflict");
-        let meta = SectionMetadata { anchor: None, tags: vec![], summary: None, locked: false };
+        let meta = SectionMetadata {
+            anchor: None,
+            tags: vec![],
+            summary: None,
+            locked: false,
+        };
         let version = SectionVersion {
             version_id: version_id.clone(),
             section_id: section_id.clone(),
@@ -3301,13 +3447,15 @@ mod tests {
         write_json_create_new(
             &staged.join(format!("{}.json", version_id.as_str())),
             &version,
-        ).unwrap();
+        )
+        .unwrap();
         write_bytes_create_new(&staged.join("original_markdown"), original.as_bytes()).unwrap();
         write_bytes_create_new(&staged.join("markdown"), ours.as_bytes()).unwrap();
         write_json_create_new(
             &staged.join(format!("section-{}.json", section_id.as_str())),
             &updated_record,
-        ).unwrap();
+        )
+        .unwrap();
 
         // External edit to the SAME line — should produce an irreconcilable conflict.
         workspace.write("doc.md", externally);
@@ -3318,7 +3466,14 @@ mod tests {
             "expected ExternalContentConflict, got: {result:?}"
         );
         // Disk preserves the external edit; transaction dir remains for inspection.
-        assert_eq!(workspace.read("doc.md"), externally, "external edit should be preserved");
-        assert!(transaction_root.exists(), "transaction dir should remain on conflict");
+        assert_eq!(
+            workspace.read("doc.md"),
+            externally,
+            "external edit should be preserved"
+        );
+        assert!(
+            transaction_root.exists(),
+            "transaction dir should remain on conflict"
+        );
     }
 }

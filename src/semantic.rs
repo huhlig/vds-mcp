@@ -20,19 +20,34 @@
 //! Unlike the legacy implementation that rebuilt the index for every query, this
 //! builds one persistent index per workspace generation and updates it incrementally.
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 use std::collections::BTreeMap;
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 use hnsw_vector_search::HnswGraph;
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 use crate::document::{DocumentId, Section, SectionId, TextEmbedding};
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 use crate::workspace::WorkspaceState;
 
 /// Filters and result limits for semantic search.
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone, Debug)]
 pub struct SemanticSearchOptions {
     pub document_id: Option<DocumentId>,
@@ -47,7 +62,10 @@ pub struct SemanticSearchOptions {
     pub ef: Option<usize>,
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl Default for SemanticSearchOptions {
     fn default() -> Self {
         Self {
@@ -63,7 +81,10 @@ impl Default for SemanticSearchOptions {
 }
 
 /// One ranked section returned by semantic search.
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone, Debug)]
 pub struct SemanticSearchResult {
     pub document_id: DocumentId,
@@ -78,7 +99,10 @@ pub struct SemanticSearchResult {
 }
 
 /// Persistent semantic index for one workspace generation.
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone)]
 pub struct SemanticIndex {
     graph: HnswGraph,
@@ -86,7 +110,10 @@ pub struct SemanticIndex {
     sections_by_id: BTreeMap<SectionId, usize>,
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl Default for SemanticIndex {
     fn default() -> Self {
         Self {
@@ -97,7 +124,10 @@ impl Default for SemanticIndex {
     }
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone, Debug)]
 struct IndexedSemanticSection {
     document_id: DocumentId,
@@ -109,7 +139,10 @@ struct IndexedSemanticSection {
     node_id: usize,
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl SemanticIndex {
     /// Builds a complete semantic index from sections that have embeddings.
     pub fn build(workspace: &WorkspaceState, options: &SemanticSearchOptions) -> Self {
@@ -186,49 +219,50 @@ impl SemanticIndex {
                 let node_id = result.0;
                 let distance = result.1;
 
-                self.sections.iter().find(|s| s.node_id == node_id).and_then(|section| {
-                    // Apply filters
-                    if let Some(doc_id) = &options.document_id {
-                        if &section.document_id != doc_id {
+                self.sections
+                    .iter()
+                    .find(|s| s.node_id == node_id)
+                    .and_then(|section| {
+                        // Apply filters
+                        if let Some(doc_id) = &options.document_id
+                            && &section.document_id != doc_id
+                        {
                             return None;
                         }
-                    }
 
-                    if let Some(prefix) = normalized_prefix.as_deref() {
-                        let matches = section.relative_path == prefix
-                            || section
-                                .relative_path
-                                .strip_prefix(prefix)
-                                .is_some_and(|suffix| suffix.starts_with('/'));
-                        if !matches {
+                        if let Some(prefix) = normalized_prefix.as_deref() {
+                            let matches = section.relative_path == prefix
+                                || section
+                                    .relative_path
+                                    .strip_prefix(prefix)
+                                    .is_some_and(|suffix| suffix.starts_with('/'));
+                            if !matches {
+                                return None;
+                            }
+                        }
+
+                        if options.require_same_model && section.embedding.model != query.model {
                             return None;
                         }
-                    }
 
-                    if options.require_same_model {
-                        if section.embedding.model != query.model {
+                        // Dimension mismatch check
+                        if section.embedding.vector.len() != query.vector.len() {
                             return None;
                         }
-                    }
 
-                    // Dimension mismatch check
-                    if section.embedding.vector.len() != query.vector.len() {
-                        return None;
-                    }
+                        // Convert distance to similarity score (higher is better)
+                        let score = 1.0 / (1.0 + distance);
 
-                    // Convert distance to similarity score (higher is better)
-                    let score = 1.0 / (1.0 + distance);
-
-                    Some(SemanticSearchResult {
-                        document_id: section.document_id.clone(),
-                        relative_path: section.relative_path.clone(),
-                        section_id: section.section_id.clone(),
-                        title: section.title.clone(),
-                        heading_ancestry: section.heading_ancestry.clone(),
-                        score,
-                        distance,
+                        Some(SemanticSearchResult {
+                            document_id: section.document_id.clone(),
+                            relative_path: section.relative_path.clone(),
+                            section_id: section.section_id.clone(),
+                            title: section.title.clone(),
+                            heading_ancestry: section.heading_ancestry.clone(),
+                            score,
+                            distance,
+                        })
                     })
-                })
             })
             .collect()
     }
@@ -306,7 +340,10 @@ impl SemanticIndex {
     }
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 fn section_ancestry(
     section: &Section,
     sections_by_id: &BTreeMap<SectionId, &Section>,
@@ -326,7 +363,10 @@ fn section_ancestry(
     titles
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 fn normalize_path_prefix(prefix: &str) -> String {
     prefix.replace('\\', "/").trim_end_matches('/').to_owned()
 }

@@ -24,7 +24,10 @@ use chrono::{DateTime, Utc};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 use crate::document::TextEmbedding;
 use crate::document::{
     Document, DocumentId, DocumentSnapshot, EditOptions, Section, SectionId, SectionInfo,
@@ -214,7 +217,10 @@ pub trait VdsMcpSurface {
         Vec<FullTextSearchResult>
     );
     /// Searches sections by semantic embedding nearest neighbors.
-    #[cfg(feature = "semantic-search")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     unsupported_surface_method!(
         semantic_search_sections,
         SemanticSearchSectionsParams,
@@ -351,7 +357,10 @@ pub enum VdsTool {
     /// Tool for [`VdsMcpSurface::full_text_search`].
     FullTextSearch,
     /// Tool for [`VdsMcpSurface::semantic_search_sections`].
-    #[cfg(feature = "semantic-search")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     SemanticSearchSections,
     /// Tool for [`VdsMcpSurface::find_by_title`].
     FindByTitle,
@@ -383,7 +392,10 @@ pub enum VdsTool {
 
 impl VdsTool {
     /// Every VDS tool in the order it should usually be presented to clients.
-    #[cfg(not(feature = "semantic-search"))]
+    #[cfg(not(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    )))]
     pub const ALL: [Self; 57] = [
         Self::ListDocuments,
         Self::CreateDocument,
@@ -445,7 +457,10 @@ impl VdsTool {
     ];
 
     /// Every VDS tool in the order it should usually be presented to clients.
-    #[cfg(feature = "semantic-search")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub const ALL: [Self; 58] = [
         Self::ListDocuments,
         Self::CreateDocument,
@@ -554,7 +569,10 @@ impl VdsTool {
             Self::DiffDocumentSnapshots => "diff_document_snapshots",
             Self::SearchSections => "search_sections",
             Self::FullTextSearch => "full_text_search",
-            #[cfg(feature = "semantic-search")]
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             Self::SemanticSearchSections => "semantic_search_sections",
             Self::FindByTitle => "find_by_title",
             Self::FindByTag => "find_by_tag",
@@ -795,7 +813,10 @@ impl VdsTool {
                 "Searches current section titles and content across the materialized workspace.",
                 "Use this for workspace-wide lexical discovery, optionally restricted by document or path prefix.",
             ),
-            #[cfg(feature = "semantic-search")]
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             Self::SemanticSearchSections => (
                 "Semantic search sections",
                 "Searches sections by semantic similarity using HNSW nearest-neighbor index.",
@@ -1412,7 +1433,10 @@ pub struct FullTextSearchParams {
 }
 
 /// Parameters for semantic nearest-neighbor section search.
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SemanticSearchSectionsParams {
     /// Document to search.
@@ -1429,7 +1453,10 @@ pub struct SemanticSearchSectionsParams {
 }
 
 /// Local embedding model files used for semantic search queries.
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EmbeddingModelConfig {
     /// Path to an ONNX embedding model.
@@ -1565,6 +1592,13 @@ pub struct WorkspaceInfo {
     /// values to detect that cached document or section data may be stale.
     #[serde(default)]
     pub reload_count: u64,
+    /// Whether semantic search is available and the index is ready for queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    pub semantic_search_ready: Option<bool>,
 }
 
 /// Database information result.
@@ -1996,7 +2030,10 @@ impl Default for SearchOptions {
 }
 
 /// Options controlling semantic section search behavior.
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SemanticSearchOptions {
@@ -2012,7 +2049,10 @@ pub struct SemanticSearchOptions {
     pub require_same_model: bool,
 }
 
-#[cfg(feature = "semantic-search")]
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl Default for SemanticSearchOptions {
     fn default() -> Self {
         Self {

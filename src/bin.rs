@@ -20,23 +20,28 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use vds::document::DocumentId;
-use vds::mcp::{
-    ImportDocumentParams, ListDocumentsParams, RenderDocumentMarkdownParams, VdsMcpSurface,
-};
-use vds::service::VdsServer;
 
 #[derive(Debug, Parser)]
 #[command(name = "vds", about = "Versioned Document Service MCP server")]
 struct Cli {
-    #[arg(short, long, default_value = ".vds/vds.db", global = true)]
-    database: PathBuf,
-
     #[arg(short, long, global = true)]
     workspace: Option<PathBuf>,
 
-    #[arg(short, long, global = true)]
-    output: Option<PathBuf>,
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[arg(long, global = true)]
+    /// Path to ONNX embedding model file (e.g., all-MiniLM-L6-v2.onnx)
+    model_path: Option<PathBuf>,
+
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[arg(long, global = true)]
+    /// Path to HuggingFace tokenizer JSON file
+    tokenizer_path: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -46,38 +51,12 @@ struct Cli {
 enum Command {
     /// Start the filesystem-authoritative VDS server over stdio.
     Serve,
-    /// Start the legacy database-backed VDS 1 server over stdio (deprecated).
-    #[command(name = "serve-legacy", hide = true)]
-    ServeLegacy,
     /// Start the filesystem-authoritative VDS server over streamable HTTP.
     Server {
         #[arg(long, default_value = "127.0.0.1:8001")]
         bind: String,
         #[arg(long, default_value = "/mcp")]
         path: String,
-    },
-    /// Legacy database-backed VDS 1 HTTP server (deprecated).
-    #[command(name = "server-legacy", hide = true)]
-    ServerLegacy {
-        #[arg(long, default_value = "127.0.0.1:8001")]
-        bind: String,
-        #[arg(long, default_value = "/mcp")]
-        path: String,
-    },
-    /// List documents in storage.
-    List,
-    /// Import a Markdown document into storage.
-    Import {
-        /// Markdown file to import.
-        path: PathBuf,
-        /// Document name to store. Defaults to the input file stem.
-        #[arg(short, long)]
-        name: Option<String>,
-    },
-    /// Export a Markdown document.
-    Export {
-        /// Document ID to export.
-        document_id: String,
     },
     /// Create or append VDS-MCP usage instructions to AGENTS.md in the project root.
     Onboard,
@@ -87,78 +66,64 @@ enum Command {
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
-    // Determine the database path: use workspace if provided, otherwise use database flag
-    let workspace = cli.workspace.clone();
-    let database = if let Some(workspace) = &cli.workspace {
-        workspace.join(".vds").join("vds.db")
-    } else {
-        cli.database
-    };
-
     match cli.command {
         Command::Serve => {
-            let workspace = workspace.unwrap_or(std::env::current_dir()?);
-            vds::filesystem_service::serve_filesystem_stdio(workspace).await?
+            let workspace = cli.workspace.unwrap_or(std::env::current_dir()?);
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            let embedding_config = match (cli.model_path, cli.tokenizer_path) {
+                (Some(model), Some(tokenizer)) => {
+                    Some(vds::filesystem_service::EmbeddingConfig::Files {
+                        model_path: model,
+                        tokenizer_path: tokenizer,
+                    })
+                }
+                _ => vds::filesystem_service::EmbeddingConfig::default_embedded(),
+            };
+            vds::filesystem_service::serve_filesystem_stdio(
+                workspace,
+                #[cfg(all(
+                    feature = "semantic-search",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
+                embedding_config,
+            )
+            .await?
         }
-        Command::ServeLegacy => vds::service::serve_stdio(database).await?,
         Command::Server { bind, path } => {
-            let workspace = workspace.unwrap_or(std::env::current_dir()?);
-            vds::filesystem_service::serve_filesystem_http(workspace, bind, path).await?
-        }
-        Command::ServerLegacy { bind, path } => {
-            vds::service::serve_streamable_http(database, bind, path).await?
-        }
-        Command::List => {
-            let server = VdsServer::open(database)?;
-            let documents = mcp(server.list_documents(ListDocumentsParams::default()))?;
-            write_text(cli.output, serde_json::to_string_pretty(&documents)?)?;
-        }
-        Command::Import { path, name } => {
-            let server = VdsServer::open(database)?;
-            let name = name.unwrap_or_else(|| document_name_from_path(&path));
-            let document = mcp(server.import_document(ImportDocumentParams {
-                name,
-                path: path.to_string_lossy().into_owned(),
-            }))?;
-            write_text(cli.output, serde_json::to_string_pretty(&document)?)?;
-        }
-        Command::Export { document_id } => {
-            let server = VdsServer::open(database)?;
-            let markdown = mcp(
-                server.render_document_markdown(RenderDocumentMarkdownParams {
-                    document_id: DocumentId::new(document_id),
-                }),
-            )?;
-            write_text(cli.output, markdown)?;
+            let workspace = cli.workspace.unwrap_or(std::env::current_dir()?);
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            let embedding_config = match (cli.model_path, cli.tokenizer_path) {
+                (Some(model), Some(tokenizer)) => {
+                    Some(vds::filesystem_service::EmbeddingConfig::Files {
+                        model_path: model,
+                        tokenizer_path: tokenizer,
+                    })
+                }
+                _ => vds::filesystem_service::EmbeddingConfig::default_embedded(),
+            };
+            vds::filesystem_service::serve_filesystem_http(
+                workspace,
+                bind,
+                path,
+                #[cfg(all(
+                    feature = "semantic-search",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
+                embedding_config,
+            )
+            .await?
         }
         Command::Onboard => {
             onboard_agent()?;
         }
     }
     Ok(())
-}
-
-fn mcp<T>(result: vds::mcp::McpResult<T>) -> Result<T, Box<dyn Error>> {
-    result.map_err(|error| {
-        std::io::Error::other(format!("{:?}: {}", error.code, error.message)).into()
-    })
-}
-
-fn write_text(output: Option<PathBuf>, text: String) -> Result<(), Box<dyn Error>> {
-    if let Some(path) = output {
-        std::fs::write(path, text)?;
-    } else {
-        println!("{text}");
-    }
-    Ok(())
-}
-
-fn document_name_from_path(path: &std::path::Path) -> String {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("document")
-        .to_owned()
 }
 
 fn onboard_agent() -> Result<(), Box<dyn Error>> {

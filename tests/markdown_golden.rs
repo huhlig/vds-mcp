@@ -28,10 +28,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use rmcp::model::JsonObject;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use vds::filesystem_service::FilesystemVdsServer;
-use rmcp::model::JsonObject;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +50,15 @@ fn write_md(workspace: &PathBuf, name: &str, content: &str) -> PathBuf {
 }
 
 fn open(workspace: &PathBuf) -> FilesystemVdsServer {
-    FilesystemVdsServer::open(workspace).expect("open server")
+    FilesystemVdsServer::open(
+        workspace,
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        None,
+    )
+    .expect("open server")
 }
 
 fn args(value: Value) -> Option<JsonObject> {
@@ -84,15 +92,22 @@ fn managed_server(workspace: &PathBuf) -> (FilesystemVdsServer, String) {
     let server = open(workspace);
     let docs = call_ok(&server, "list_documents", json!({}));
     let doc_id = docs[0]["id"].as_str().unwrap().to_owned();
-    call_ok(&server, "manage_document_file", json!({ "document_id": doc_id }));
+    call_ok(
+        &server,
+        "manage_document_file",
+        json!({ "document_id": doc_id }),
+    );
     (server, doc_id)
 }
 
 /// Return the section_id for the first ToC entry with the given title.
 fn section_id_by_title(server: &FilesystemVdsServer, doc_id: &str, title: &str) -> String {
-    let toc = call_ok(server, "table_of_contents", json!({ "document_id": doc_id }));
-    find_in_toc(&toc, title)
-        .unwrap_or_else(|| panic!("section {title:?} not found in ToC:\n{toc}"))
+    let toc = call_ok(
+        server,
+        "table_of_contents",
+        json!({ "document_id": doc_id }),
+    );
+    find_in_toc(&toc, title).unwrap_or_else(|| panic!("section {title:?} not found in ToC:\n{toc}"))
 }
 
 fn find_in_toc(entries: &Value, title: &str) -> Option<String> {
@@ -122,16 +137,19 @@ fn golden_update_section_middle() {
     let (server, doc_id) = managed_server(&ws);
     let sid = section_id_by_title(&server, &doc_id, "Alpha");
 
-    call_ok(&server, "update_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "content": "Replaced alpha."
-    }));
+    call_ok(
+        &server,
+        "update_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "content": "Replaced alpha."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
-        result,
-        "# Title\n\nPreamble.\n\n## Alpha\n\nReplaced alpha.\n\n## Beta\n\nBeta body.\n",
+        result, "# Title\n\nPreamble.\n\n## Alpha\n\nReplaced alpha.\n\n## Beta\n\nBeta body.\n",
         "update_section produced unexpected output"
     );
 }
@@ -147,11 +165,15 @@ fn golden_update_section_last() {
     let (server, doc_id) = managed_server(&ws);
     let sid = section_id_by_title(&server, &doc_id, "Last");
 
-    call_ok(&server, "update_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "content": "New last body."
-    }));
+    call_ok(
+        &server,
+        "update_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "content": "New last body."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
@@ -173,11 +195,15 @@ fn golden_rename_section_heading_only() {
     let (server, doc_id) = managed_server(&ws);
     let sid = section_id_by_title(&server, &doc_id, "Alpha");
 
-    call_ok(&server, "rename_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "new_title": "Renamed"
-    }));
+    call_ok(
+        &server,
+        "rename_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "new_title": "Renamed"
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
@@ -199,11 +225,15 @@ fn golden_append_to_section() {
     let (server, doc_id) = managed_server(&ws);
     let sid = section_id_by_title(&server, &doc_id, "Section");
 
-    call_ok(&server, "append_to_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "content": "Appended line."
-    }));
+    call_ok(
+        &server,
+        "append_to_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "content": "Appended line."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
@@ -223,16 +253,19 @@ fn golden_create_section_appended_to_document() {
 
     // Without a parent_id the section is created as a sibling of Doc (both children
     // of the synthetic root), so the new section gets level 1 (H1).
-    call_ok(&server, "create_section", json!({
-        "document_id": doc_id,
-        "title": "New Section",
-        "content": "New body."
-    }));
+    call_ok(
+        &server,
+        "create_section",
+        json!({
+            "document_id": doc_id,
+            "title": "New Section",
+            "content": "New body."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
-        result,
-        "# Doc\n\nRoot content.\n\n# New Section\n\nNew body.\n",
+        result, "# Doc\n\nRoot content.\n\n# New Section\n\nNew body.\n",
         "create_section without parent_id appends an H1 sibling of Doc"
     );
 }
@@ -245,17 +278,20 @@ fn golden_create_section_as_child_produces_h2() {
     let doc_sid = section_id_by_title(&server, &doc_id, "Doc");
 
     // Creating under Doc (H1) produces an H2.
-    call_ok(&server, "create_section", json!({
-        "document_id": doc_id,
-        "parent_id": doc_sid,
-        "title": "Child Section",
-        "content": "Child body."
-    }));
+    call_ok(
+        &server,
+        "create_section",
+        json!({
+            "document_id": doc_id,
+            "parent_id": doc_sid,
+            "title": "Child Section",
+            "content": "Child body."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
-        result,
-        "# Doc\n\nRoot content.\n\n## Child Section\n\nChild body.\n",
+        result, "# Doc\n\nRoot content.\n\n## Child Section\n\nChild body.\n",
         "create_section under an H1 parent produces an H2 child"
     );
 }
@@ -273,11 +309,15 @@ fn golden_remove_section_middle() {
     let (server, doc_id) = managed_server(&ws);
     let sid = section_id_by_title(&server, &doc_id, "Remove");
 
-    call_ok(&server, "remove_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "remove_children": false
-    }));
+    call_ok(
+        &server,
+        "remove_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "remove_children": false
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
@@ -302,15 +342,23 @@ fn golden_reorder_sections_reverses_children() {
     let id_third = section_id_by_title(&server, &doc_id, "Third");
 
     // Get the doc root section id from ToC parent
-    let toc = call_ok(&server, "table_of_contents", json!({ "document_id": doc_id }));
+    let toc = call_ok(
+        &server,
+        "table_of_contents",
+        json!({ "document_id": doc_id }),
+    );
     // The "Doc" heading is the parent; get its section_id.
     let parent_id = find_in_toc(&toc, "Doc").expect("Doc section");
 
-    call_ok(&server, "reorder_sections", json!({
-        "document_id": doc_id,
-        "parent_id": parent_id,
-        "ordered_children": [id_third, id_second, id_first]
-    }));
+    call_ok(
+        &server,
+        "reorder_sections",
+        json!({
+            "document_id": doc_id,
+            "parent_id": parent_id,
+            "ordered_children": [id_third, id_second, id_first]
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert_eq!(
@@ -334,24 +382,34 @@ fn golden_split_section_produces_two_sections() {
 
     // Content of Combined is "First part.\n\nSecond part." — split at byte 13
     // (after "First part.\n") puts "Second part." into the new section.
-    call_ok(&server, "split_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "new_title": "Part Two",
-        "split_at": 13
-    }));
+    call_ok(
+        &server,
+        "split_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "new_title": "Part Two",
+            "split_at": 13
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     // The original section keeps the first part; the new section gets the second.
     assert!(result.contains("## Combined\n"), "original heading kept");
     assert!(result.contains("First part."), "first part kept");
     assert!(result.contains("## Part Two\n"), "new section created");
-    assert!(result.contains("Second part."), "second part in new section");
+    assert!(
+        result.contains("Second part."),
+        "second part in new section"
+    );
     // The split point separates them — second part must not appear under Combined.
     let combined_start = result.find("## Combined").unwrap();
     let part_two_start = result.find("## Part Two").unwrap();
     let second_in_combined = result[combined_start..part_two_start].contains("Second part.");
-    assert!(!second_in_combined, "second part must not appear before Part Two heading");
+    assert!(
+        !second_in_combined,
+        "second part must not appear before Part Two heading"
+    );
 }
 
 // ── preservation: fenced code through structural mutation ─────────────────────
@@ -372,19 +430,26 @@ fn golden_fenced_code_survives_create_section() {
 
     // Create Usage as a child of Guide (H1) so it becomes H2.
     let guide_sid = section_id_by_title(&server, &doc_id, "Guide");
-    call_ok(&server, "create_section", json!({
-        "document_id": doc_id,
-        "parent_id": guide_sid,
-        "title": "Usage",
-        "content": "Run `vds`."
-    }));
+    call_ok(
+        &server,
+        "create_section",
+        json!({
+            "document_id": doc_id,
+            "parent_id": guide_sid,
+            "title": "Usage",
+            "content": "Run `vds`."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert!(
         result.contains("```sh\ncargo install vds\n```"),
         "fenced code block must survive structural create_section:\n{result}"
     );
-    assert!(result.contains("## Usage\n\nRun `vds`."), "new H2 section created:\n{result}");
+    assert!(
+        result.contains("## Usage\n\nRun `vds`."),
+        "new H2 section created:\n{result}"
+    );
 }
 
 #[test]
@@ -404,14 +469,22 @@ fn golden_fenced_code_survives_reorder() {
     let (server, doc_id) = managed_server(&ws);
     let id_a = section_id_by_title(&server, &doc_id, "A");
     let id_b = section_id_by_title(&server, &doc_id, "B");
-    let toc = call_ok(&server, "table_of_contents", json!({ "document_id": doc_id }));
+    let toc = call_ok(
+        &server,
+        "table_of_contents",
+        json!({ "document_id": doc_id }),
+    );
     let parent_id = find_in_toc(&toc, "Doc").expect("Doc section");
 
-    call_ok(&server, "reorder_sections", json!({
-        "document_id": doc_id,
-        "parent_id": parent_id,
-        "ordered_children": [id_b, id_a]
-    }));
+    call_ok(
+        &server,
+        "reorder_sections",
+        json!({
+            "document_id": doc_id,
+            "parent_id": parent_id,
+            "ordered_children": [id_b, id_a]
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert!(
@@ -436,11 +509,15 @@ fn golden_heading_id_survives_create_section() {
     );
     let (server, doc_id) = managed_server(&ws);
 
-    call_ok(&server, "create_section", json!({
-        "document_id": doc_id,
-        "title": "Usage",
-        "content": "Usage body."
-    }));
+    call_ok(
+        &server,
+        "create_section",
+        json!({
+            "document_id": doc_id,
+            "title": "Usage",
+            "content": "Usage body."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
     assert!(
@@ -473,14 +550,27 @@ fn golden_html_comment_survives_content_edit() {
     let (server, doc_id) = managed_server(&ws);
     let sid = section_id_by_title(&server, &doc_id, "Section B");
 
-    call_ok(&server, "update_section", json!({
-        "document_id": doc_id,
-        "section_id": sid,
-        "content": "New B."
-    }));
+    call_ok(
+        &server,
+        "update_section",
+        json!({
+            "document_id": doc_id,
+            "section_id": sid,
+            "content": "New B."
+        }),
+    );
 
     let result = fs::read_to_string(&file).unwrap();
-    assert!(result.contains("<!-- top-level comment -->"), "top-level comment preserved");
-    assert!(result.contains("<!-- section comment -->"), "section comment preserved");
-    assert!(result.contains("## Section B\n\nNew B.\n"), "edit applied correctly");
+    assert!(
+        result.contains("<!-- top-level comment -->"),
+        "top-level comment preserved"
+    );
+    assert!(
+        result.contains("<!-- section comment -->"),
+        "section comment preserved"
+    );
+    assert!(
+        result.contains("## Section B\n\nNew B.\n"),
+        "edit applied correctly"
+    );
 }

@@ -42,33 +42,315 @@ use crate::document::{
     SectionId, SectionInfo, SectionMetadata, SectionPatch, SectionVersion, TableOfContentsEntry,
     ValidationDiagnostic, VersionId,
 };
+use crate::markdown::{apply_content_edit, apply_heading_rename, render_sections_to_markdown};
 use crate::mcp::{
     AppendToSectionParams, CreateDocumentParams, CreateDocumentSnapshotParams, CreateSectionParams,
-    DemoteSectionParams, DiffDocumentSnapshotsParams, DiffFormat, DiffHunk, DiffLine,
+    DatabaseInfo, DemoteSectionParams, DiffDocumentSnapshotsParams, DiffFormat, DiffHunk, DiffLine,
     DiffLineKind, DiffResult, DiffSectionVersionsParams, DocumentFileMutationResult, DocumentInfo,
-    DocumentLocation, DocumentSnapshotInfo, DocumentSnapshotsParams, DatabaseInfo,
-    ExportDocumentParams, ExportResult, FindByTagParams, FindByTitleParams,
-    FullTextSearchParams, FullTextSearchResult, GetDatabaseParams, GetDocumentLocationParams,
-    GetDocumentParams, GetSectionParams, GetSectionTreeParams, GetSectionsParams,
-    GetSectionVersionParams, GetWorkspaceParams, ImportDocumentParams, InsertSectionAfterParams,
-    InsertSectionBeforeParams, ListDocumentsParams, ManageDocumentFileParams, McpError,
-    McpErrorCode, McpResult, MoveDocumentFileParams, MoveSectionParams, PatchSectionParams,
-    PromoteSectionParams, RemoveDocumentFileParams, RemovedSectionInfo, RenameDocumentFileParams,
-    RenameDocumentParams, RenameSectionParams, RemoveSectionParams, RenderDocumentMarkdownParams,
-    RenderSectionMarkdownParams, ReorderSectionsParams, RestoreDocumentFileParams,
-    RestoreDocumentSnapshotParams, SearchSectionsParams, SectionSearchResult, SectionTree,
-    SectionVersionInfo, SectionVersionsParams, SetSectionMetadataParams, SetWorkspaceParams,
-    SplitSectionParams, SplitSectionResult, SwitchSectionVersionParams, TableOfContentsParams,
-    TextMatch, UnmanageDocumentFileParams, UpdateSectionParams, ValidateDocumentParams,
-    VdsMcpSurface, WorkspaceInfo, tool_documentation,
+    DocumentLocation, DocumentSnapshotInfo, DocumentSnapshotsParams, ExportDocumentParams,
+    ExportResult, FindByTagParams, FindByTitleParams, FullTextSearchParams, FullTextSearchResult,
+    GetDatabaseParams, GetDocumentLocationParams, GetDocumentParams, GetSectionParams,
+    GetSectionTreeParams, GetSectionVersionParams, GetSectionsParams, GetWorkspaceParams,
+    ImportDocumentParams, InsertSectionAfterParams, InsertSectionBeforeParams, ListDocumentsParams,
+    ManageDocumentFileParams, McpError, McpErrorCode, McpResult, MoveDocumentFileParams,
+    MoveSectionParams, PatchSectionParams, PromoteSectionParams, RemoveDocumentFileParams,
+    RemoveSectionParams, RemovedSectionInfo, RenameDocumentFileParams, RenameDocumentParams,
+    RenameSectionParams, RenderDocumentMarkdownParams, RenderSectionMarkdownParams,
+    ReorderSectionsParams, RestoreDocumentFileParams, RestoreDocumentSnapshotParams,
+    SearchSectionsParams, SectionSearchResult, SectionTree, SectionVersionInfo,
+    SectionVersionsParams, SetSectionMetadataParams, SetWorkspaceParams, SplitSectionParams,
+    SplitSectionResult, SwitchSectionVersionParams, TableOfContentsParams, TextMatch,
+    UnmanageDocumentFileParams, UpdateSectionParams, ValidateDocumentParams, VdsMcpSurface,
+    WorkspaceInfo, tool_documentation,
 };
-use crate::markdown::{apply_content_edit, apply_heading_rename, render_sections_to_markdown};
-use crate::metadata::{CurrentDocumentRecord, MetadataRepository, SectionRecord, SectionMatchingRecord, WorkspaceLease, METADATA_FORMAT_VERSION};
+use crate::metadata::{
+    CurrentDocumentRecord, METADATA_FORMAT_VERSION, MetadataRepository, SectionMatchingRecord,
+    SectionRecord, WorkspaceLease,
+};
 use crate::search::{FullTextIndex, FullTextSearchOptions};
-use crate::service::{to_rmcp_error, tool_from_doc};
 use crate::workspace::{
     MaterializedDocument, WorkspaceError, WorkspaceState, is_markdown_path_eligible,
 };
+
+/// Configuration for embedding generation.
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[derive(Clone, Debug)]
+pub enum EmbeddingConfig {
+    /// Use embedded model data compiled into the binary
+    Embedded {
+        model_data: &'static [u8],
+        tokenizer_data: &'static [u8],
+    },
+    /// Use model files from disk
+    Files {
+        model_path: PathBuf,
+        tokenizer_path: PathBuf,
+    },
+}
+
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
+impl EmbeddingConfig {
+    /// Returns the default embedded model configuration.
+    ///
+    /// The model files can be included at compile time via `include_bytes!` if the
+    /// `embed-model` feature is enabled and model files exist.
+    /// Otherwise falls back to environment or filesystem paths.
+    pub fn default_embedded() -> Option<Self> {
+        // Try to use embedded model data if the embed-model feature is enabled
+        #[cfg(all(feature = "semantic-search", feature = "embed-model"))]
+        {
+            return Some(Self::Embedded {
+                model_data: include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/models/all-MiniLM-L6-v2.onnx"
+                )),
+                tokenizer_data: include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/models/tokenizer.json"
+                )),
+            });
+        }
+
+        // Fall back to environment or default filesystem locations
+        #[cfg(all(
+            feature = "semantic-search",
+            not(feature = "embed-model"),
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        {
+            Self::from_env_or_default()
+        }
+
+        #[cfg(not(feature = "semantic-search"))]
+        {
+            None
+        }
+    }
+
+    /// Attempts to load embedding configuration from environment variables or default locations.
+    ///
+    /// Checks in order:
+    /// 1. VDS_EMBEDDING_MODEL_PATH and VDS_EMBEDDING_TOKENIZER_PATH environment variables
+    /// 2. ~/.vds/models/ directory for common model files
+    /// 3. Returns None if no configuration is found
+    pub fn from_env_or_default() -> Option<Self> {
+        use std::env;
+
+        // Try environment variables first
+        if let (Ok(model), Ok(tokenizer)) = (
+            env::var("VDS_EMBEDDING_MODEL_PATH"),
+            env::var("VDS_EMBEDDING_TOKENIZER_PATH"),
+        ) {
+            return Some(Self::Files {
+                model_path: PathBuf::from(model),
+                tokenizer_path: PathBuf::from(tokenizer),
+            });
+        }
+
+        // Try default location in ~/.vds/models/
+        if let Some(home) = dirs::home_dir() {
+            let model_dir = home.join(".vds/models");
+            let model_path = model_dir.join("all-MiniLM-L6-v2.onnx");
+            let tokenizer_path = model_dir.join("tokenizer.json");
+
+            if model_path.exists() && tokenizer_path.exists() {
+                return Some(Self::Files {
+                    model_path,
+                    tokenizer_path,
+                });
+            }
+        }
+
+        None
+    }
+}
+
+/// Converts MCP errors to RMCP error format.
+pub(crate) fn to_rmcp_error(error: McpError) -> RmcpError {
+    let data = Some(json!({
+        "code": error.code,
+        "message": error.message,
+    }));
+    match error.code {
+        McpErrorCode::NotFound => RmcpError::resource_not_found("VDS item not found", data),
+        McpErrorCode::InvalidInput | McpErrorCode::Conflict | McpErrorCode::Locked => {
+            RmcpError::invalid_params("invalid VDS MCP request", data)
+        }
+        McpErrorCode::Storage | McpErrorCode::Internal => {
+            RmcpError::internal_error("VDS MCP service error", data)
+        }
+    }
+}
+
+/// Converts tool documentation to MCP Tool format.
+pub(crate) fn tool_from_doc(doc: crate::mcp::ToolDocumentation) -> rmcp::model::Tool {
+    use std::sync::Arc;
+    rmcp::model::Tool::new(
+        doc.name,
+        format!("{} {}", doc.description, doc.usage),
+        Arc::new(match tool_schema_value(doc.tool) {
+            Value::Object(object) => object,
+            _ => JsonObject::new(),
+        }),
+    )
+    .with_title(doc.title)
+}
+
+fn tool_schema_value(tool: crate::mcp::VdsTool) -> Value {
+    serde_json::to_value(tool).unwrap_or(Value::Null)
+}
+
+/// Wrapper for embedding generation that holds the embedder and cache.
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
+struct EmbeddingGenerator {
+    embedder: hnsw_vector_search::OnnxEmbedder,
+    cache: crate::embedding_cache::EmbeddingCache,
+    model_name: String,
+}
+
+#[cfg(all(
+    feature = "semantic-search",
+    any(target_os = "linux", target_os = "macos")
+))]
+impl EmbeddingGenerator {
+    fn new(config: &EmbeddingConfig, workspace_root: &Path) -> Result<Self, WorkspaceError> {
+        let (embedder, model_name) = match config {
+            EmbeddingConfig::Embedded {
+                model_data,
+                tokenizer_data,
+            } => {
+                // Write embedded data to temp files for OnnxEmbedder
+                let temp_dir =
+                    std::env::temp_dir().join(format!("vds-embedded-{}", std::process::id()));
+                fs::create_dir_all(&temp_dir).map_err(|e| WorkspaceError::Io {
+                    path: temp_dir.clone(),
+                    source: e,
+                })?;
+
+                let model_path = temp_dir.join("model.onnx");
+                let tokenizer_path = temp_dir.join("tokenizer.json");
+
+                fs::write(&model_path, model_data).map_err(|e| WorkspaceError::Io {
+                    path: model_path.clone(),
+                    source: e,
+                })?;
+                fs::write(&tokenizer_path, tokenizer_data).map_err(|e| WorkspaceError::Io {
+                    path: tokenizer_path.clone(),
+                    source: e,
+                })?;
+
+                let embedder = hnsw_vector_search::OnnxEmbedder::new(&model_path, &tokenizer_path)
+                    .map_err(|e| {
+                        WorkspaceError::Other(format!("Failed to initialize embedder: {}", e))
+                    })?;
+
+                (embedder, "embedded-all-MiniLM-L6-v2".to_owned())
+            }
+            EmbeddingConfig::Files {
+                model_path,
+                tokenizer_path,
+            } => {
+                let embedder = hnsw_vector_search::OnnxEmbedder::new(model_path, tokenizer_path)
+                    .map_err(|e| {
+                        WorkspaceError::Other(format!("Failed to initialize embedder: {}", e))
+                    })?;
+                let model_name = model_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("custom")
+                    .to_owned();
+                (embedder, model_name)
+            }
+        };
+
+        let cache = crate::embedding_cache::EmbeddingCache::open(workspace_root)
+            .map_err(|e| WorkspaceError::Other(format!("Failed to open embedding cache: {}", e)))?;
+
+        Ok(Self {
+            embedder,
+            cache,
+            model_name,
+        })
+    }
+
+    /// Generates an embedding for the given text.
+    fn embed(&mut self, text: &str) -> Result<crate::document::TextEmbedding, WorkspaceError> {
+        let vector = self
+            .embedder
+            .embed(text)
+            .map_err(|e| WorkspaceError::Other(format!("Embedding generation failed: {}", e)))?;
+        Ok(crate::document::TextEmbedding {
+            model: Some(self.model_name.clone()),
+            vector,
+        })
+    }
+
+    /// Generates embeddings for all sections in a document, using cache when possible.
+    ///
+    /// Returns a map of section_id -> TextEmbedding for sections that now have embeddings.
+    fn generate_embeddings_for_document(
+        &mut self,
+        document: &MaterializedDocument,
+    ) -> Result<BTreeMap<crate::document::SectionId, crate::document::TextEmbedding>, WorkspaceError>
+    {
+        use sha2::Digest;
+        let mut embeddings = BTreeMap::new();
+
+        for section in &document.sections {
+            // Compute content hash for this section
+            let content_text = format!("{}\n{}", section.title, section.content);
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(content_text.as_bytes());
+            let content_hash = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+            // Check cache first
+            match self
+                .cache
+                .get(&section.section_id, &content_hash, &self.model_name)
+            {
+                Ok(Some(cached_embedding)) => {
+                    embeddings.insert(section.section_id.clone(), cached_embedding);
+                }
+                Ok(None) => {
+                    // Not in cache, generate new embedding
+                    let embedding = self.embed(&content_text)?;
+
+                    // Save to cache
+                    if let Err(e) = self
+                        .cache
+                        .put(&section.section_id, &content_hash, &embedding)
+                    {
+                        eprintln!(
+                            "Warning: Failed to cache embedding for section {:?}: {}",
+                            section.section_id, e
+                        );
+                    }
+
+                    embeddings.insert(section.section_id.clone(), embedding);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to check cache for section {:?}: {}. Generating without cache.",
+                        section.section_id, e
+                    );
+                    let embedding = self.embed(&content_text)?;
+                    embeddings.insert(section.section_id.clone(), embedding);
+                }
+            }
+        }
+
+        Ok(embeddings)
+    }
+}
 
 const AVAILABLE_TOOL_NAMES: &[&str] = &[
     "list_documents",
@@ -114,7 +396,10 @@ const AVAILABLE_TOOL_NAMES: &[&str] = &[
     "diff_document_snapshots",
     "search_sections",
     "full_text_search",
-    #[cfg(feature = "semantic-search")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     "semantic_search_sections",
     "find_by_title",
     "find_by_tag",
@@ -127,18 +412,31 @@ const AVAILABLE_TOOL_NAMES: &[&str] = &[
 struct WorkspaceGeneration {
     state: WorkspaceState,
     full_text: FullTextIndex,
-    #[cfg(feature = "semantic-search")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     semantic: crate::semantic::SemanticIndex,
     /// Monotonically increasing counter incremented on every live reload.
     /// Zero on initial load; non-zero means at least one external change was
     /// integrated since the server started.
     reload_count: u64,
+    /// Whether background embedding generation has completed.
+    /// This is atomic so it can be updated from a background thread.
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    embeddings_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WorkspaceGeneration {
     fn build(state: WorkspaceState, reload_count: u64) -> Self {
         let full_text = FullTextIndex::build(&state);
-        #[cfg(feature = "semantic-search")]
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         let semantic = {
             let options = crate::semantic::SemanticSearchOptions::default();
             crate::semantic::SemanticIndex::build(&state, &options)
@@ -146,9 +444,17 @@ impl WorkspaceGeneration {
         Self {
             state,
             full_text,
-            #[cfg(feature = "semantic-search")]
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             semantic,
             reload_count,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            embeddings_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -173,6 +479,13 @@ pub struct FilesystemVdsServer {
     generation: Arc<RwLock<WorkspaceGeneration>>,
     /// Prevents concurrent mutations; also guards `set_workspace` from racing with writes.
     mutation_lock: Mutex<()>,
+    /// Optional embedding generator for semantic search.
+    /// Wrapped in Mutex to allow background thread access for async embedding generation.
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    embedding_generator: Option<Arc<Mutex<EmbeddingGenerator>>>,
 }
 
 impl FilesystemVdsServer {
@@ -180,9 +493,16 @@ impl FilesystemVdsServer {
     ///
     /// Returns `Err(WorkspaceError::Lease)` if another VDS writer process
     /// already holds the lease for the same workspace root.
-    pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
-        let lease = WorkspaceLease::acquire(workspace_root.as_ref())
-            .map_err(WorkspaceError::Lease)?;
+    pub fn open(
+        workspace_root: impl AsRef<Path>,
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        embedding_config: Option<EmbeddingConfig>,
+    ) -> Result<Self, WorkspaceError> {
+        let lease =
+            WorkspaceLease::acquire(workspace_root.as_ref()).map_err(WorkspaceError::Lease)?;
         if let Ok(repository) = MetadataRepository::open(workspace_root.as_ref()) {
             repository
                 .recover_transactions()
@@ -190,14 +510,93 @@ impl FilesystemVdsServer {
         }
         let state = WorkspaceState::load(workspace_root)?;
         let workspace_root = state.root().to_path_buf();
+
+        // Build the generation without embeddings first (fast startup)
         let generation = Arc::new(RwLock::new(WorkspaceGeneration::build(state, 0)));
 
-        let (watcher, watcher_active) = start_watcher(workspace_root.clone(), Arc::clone(&generation));
+        #[cfg(all(feature = "semantic-search", any(target_os = "linux", target_os = "macos")))]
+        let embedding_generator = embedding_config
+            .as_ref()
+            .and_then(|config| {
+                match EmbeddingGenerator::new(config, &workspace_root) {
+                    Ok(generator) => {
+                        eprintln!("Semantic search enabled with model: {}", generator.model_name);
+
+                        let generator_arc = Arc::new(Mutex::new(generator));
+
+                        // Spawn background task to generate embeddings
+                        let gen_clone = Arc::clone(&generation);
+                        let gen_for_task = Arc::clone(&generator_arc);
+                        std::thread::spawn(move || {
+                            eprintln!("Starting background embedding generation...");
+
+                            // Get a snapshot of documents to embed
+                            let documents: Vec<_> = {
+                                let locked = gen_clone.read().unwrap();
+                                locked.state.documents()
+                                    .map(|d| (d.document.id.clone(), d.clone()))
+                                    .collect()
+                            };
+
+                            // Generate embeddings for all documents
+                            let mut all_embeddings = BTreeMap::new();
+                            {
+                                let mut generator = gen_for_task.lock().unwrap();
+                                for (doc_id, document) in documents {
+                                    match generator.generate_embeddings_for_document(&document) {
+                                        Ok(doc_embeddings) => {
+                                            all_embeddings.insert(doc_id, doc_embeddings);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Warning: Failed to generate embeddings for document {}: {}",
+                                                     document.relative_path, e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Apply embeddings and rebuild semantic index
+                            {
+                                let mut locked = gen_clone.write().unwrap();
+                                locked.state.apply_embeddings(all_embeddings);
+
+                                // Rebuild semantic index with the new embeddings
+                                let options = crate::semantic::SemanticSearchOptions::default();
+                                locked.semantic = crate::semantic::SemanticIndex::build(&locked.state, &options);
+
+                                // Mark embeddings as ready
+                                locked.embeddings_ready.store(true, std::sync::atomic::Ordering::Release);
+                            }
+
+                            eprintln!("Background embedding generation complete!");
+                        });
+
+                        Some(generator_arc)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize embedding generator: {}. Semantic search will be unavailable.", e);
+                        None
+                    }
+                }
+            });
+
+        let (watcher, watcher_active) =
+            start_watcher(workspace_root.clone(), Arc::clone(&generation));
 
         Ok(Self {
-            switchable: Mutex::new(SwitchableState { workspace_root, _lease: lease, _watcher: watcher, watcher_active }),
+            switchable: Mutex::new(SwitchableState {
+                workspace_root,
+                _lease: lease,
+                _watcher: watcher,
+                watcher_active,
+            }),
             generation,
             mutation_lock: Mutex::new(()),
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            embedding_generator,
         })
     }
 
@@ -213,14 +612,75 @@ impl FilesystemVdsServer {
 
     /// Builds a replacement generation off-lock and publishes it atomically.
     pub fn reload(&self) -> Result<(), WorkspaceError> {
-        MetadataRepository::open(&self.workspace_root())
+        MetadataRepository::open(self.workspace_root())
             .map_err(WorkspaceError::Metadata)?
             .recover_transactions()
             .map_err(WorkspaceError::Metadata)?;
-        let state = WorkspaceState::load(&self.workspace_root())?;
+        let mut state = WorkspaceState::load(self.workspace_root())?;
         let mut lock = self.generation.write().unwrap();
         let reload_count = lock.reload_count + 1;
         *lock = WorkspaceGeneration::build(state, reload_count);
+
+        // Spawn background embedding generation for the reloaded workspace
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        if let Some(generator) = &self.embedding_generator {
+            let gen_clone = Arc::clone(&self.generation);
+            let gen_for_task = Arc::clone(generator);
+            std::thread::spawn(move || {
+                eprintln!("Starting background embedding generation after reload...");
+
+                // Get a snapshot of documents to embed
+                let documents: Vec<_> = {
+                    let locked = gen_clone.read().unwrap();
+                    locked
+                        .state
+                        .documents()
+                        .map(|d| (d.document.id.clone(), d.clone()))
+                        .collect()
+                };
+
+                // Generate embeddings for all documents
+                let mut all_embeddings = BTreeMap::new();
+                {
+                    let mut generator = gen_for_task.lock().unwrap();
+                    for (doc_id, document) in documents {
+                        match generator.generate_embeddings_for_document(&document) {
+                            Ok(doc_embeddings) => {
+                                all_embeddings.insert(doc_id, doc_embeddings);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Failed to generate embeddings for document {}: {}",
+                                    document.relative_path, e
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Apply embeddings and rebuild semantic index
+                {
+                    let mut locked = gen_clone.write().unwrap();
+                    locked.state.apply_embeddings(all_embeddings);
+
+                    // Rebuild semantic index with the new embeddings
+                    let options = crate::semantic::SemanticSearchOptions::default();
+                    locked.semantic =
+                        crate::semantic::SemanticIndex::build(&locked.state, &options);
+
+                    // Mark embeddings as ready
+                    locked
+                        .embeddings_ready
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+
+                eprintln!("Background embedding generation complete after reload!");
+            });
+        }
+
         Ok(())
     }
 
@@ -229,20 +689,50 @@ impl FilesystemVdsServer {
     /// from disk so that all in-memory structures are consistent; only the index update
     /// step is made incremental.
     fn reload_incremental(&self, document_id: &DocumentId) -> Result<(), WorkspaceError> {
-        MetadataRepository::open(&self.workspace_root())
+        MetadataRepository::open(self.workspace_root())
             .map_err(WorkspaceError::Metadata)?
             .recover_transactions()
             .map_err(WorkspaceError::Metadata)?;
-        let state = WorkspaceState::load(&self.workspace_root())?;
+        let mut state = WorkspaceState::load(self.workspace_root())?;
+
+        // Generate embeddings for the mutated document if semantic search is enabled
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        if let Some(generator) = &self.embedding_generator
+            && let Some(document) = state.document_by_id(document_id)
+        {
+            let mut gen_lock = generator.lock().unwrap();
+            match gen_lock.generate_embeddings_for_document(document) {
+                Ok(doc_embeddings) => {
+                    let mut embeddings_map = BTreeMap::new();
+                    embeddings_map.insert(document_id.clone(), doc_embeddings);
+                    state.apply_embeddings(embeddings_map);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to generate embeddings for mutated document {}: {}",
+                        document.relative_path, e
+                    );
+                }
+            }
+        }
 
         let mut lock = self.generation.write().unwrap();
         // Take the old indices by value so we can mutate them without a full rebuild.
         let mut full_text = std::mem::take(&mut lock.full_text);
-        #[cfg(feature = "semantic-search")]
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         let mut semantic = std::mem::take(&mut lock.semantic);
 
         full_text.remove_document(document_id);
-        #[cfg(feature = "semantic-search")]
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         semantic.remove_document(document_id);
 
         if let Some(document) = state.document_by_id(document_id) {
@@ -252,16 +742,34 @@ impl FilesystemVdsServer {
                 .map(|s| (s.section_id.clone(), s))
                 .collect::<BTreeMap<_, _>>();
             full_text.add_document(document, &sections_by_id);
-            #[cfg(feature = "semantic-search")]
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             semantic.add_document(document, &sections_by_id);
         }
         let reload_count = lock.reload_count + 1;
+
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        let embeddings_ready = lock.embeddings_ready.clone(); // Preserve the existing flag
+
         *lock = WorkspaceGeneration {
             state,
             full_text,
-            #[cfg(feature = "semantic-search")]
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             semantic,
-            reload_count
+            reload_count,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            embeddings_ready,
         };
         Ok(())
     }
@@ -351,8 +859,13 @@ impl FilesystemVdsServer {
             "diff_document_snapshots" => to_value(self.diff_document_snapshots(parse(arguments)?)),
             "search_sections" => to_value(self.search_sections(parse(arguments)?)),
             "full_text_search" => to_value(self.full_text_search(parse(arguments)?)),
-            #[cfg(feature = "semantic-search")]
-            "semantic_search_sections" => to_value(self.semantic_search_sections(parse(arguments)?)),
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            "semantic_search_sections" => {
+                to_value(self.semantic_search_sections(parse(arguments)?))
+            }
             "find_by_title" => to_value(self.find_by_title(parse(arguments)?)),
             "find_by_tag" => to_value(self.find_by_tag(parse(arguments)?)),
             "validate_document" => to_value(self.validate_document(parse(arguments)?)),
@@ -386,7 +899,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
     fn rename_document(&self, params: RenameDocumentParams) -> McpResult<DocumentInfo> {
         let _mutation = self.mutation_lock.lock().unwrap();
         self.require_managed_document(&params.document_id)?;
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         repo.rename_document(&params.document_id, &params.name)
             .map_err(metadata_error)?;
         self.reload().map_err(workspace_error)?;
@@ -407,7 +920,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
     ) -> McpResult<DocumentLocation> {
         let document = self.require_document(&params.document_id)?;
         if !document.managed {
-            MetadataRepository::initialize(&self.workspace_root())
+            MetadataRepository::initialize(self.workspace_root())
                 .map_err(metadata_error)?
                 .promote(&document)
                 .map_err(metadata_error)?;
@@ -422,7 +935,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             message: "`relative_path` is required in filesystem mode".to_owned(),
         })?;
         let initial_markdown = params.initial_content.unwrap_or_default();
-        let repo = MetadataRepository::initialize(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::initialize(self.workspace_root()).map_err(metadata_error)?;
         repo.create_document_file(&relative_path, &initial_markdown, params.title)
             .map_err(metadata_error)?;
         self.reload().map_err(workspace_error)?;
@@ -441,7 +954,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             });
         }
         let doc_id = doc.document.id.clone();
-        let repo = MetadataRepository::initialize(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::initialize(self.workspace_root()).map_err(metadata_error)?;
         repo.promote(&doc).map_err(metadata_error)?;
         if !params.name.is_empty() {
             repo.rename_document(&doc_id, &params.name)
@@ -489,7 +1002,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let _mutation = self.mutation_lock.lock().unwrap();
         let document = self.require_managed_document(&params.document_id)?;
         let previous_path = document.relative_path.clone();
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         repo.remove_document_file(&params.document_id, &params.expected_content_hash)
             .map_err(metadata_error)?;
         self.reload().map_err(workspace_error)?;
@@ -509,7 +1022,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let _mutation = self.mutation_lock.lock().unwrap();
         let document = self.require_managed_document(&params.document_id)?;
         let previous_path = document.relative_path.clone();
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         repo.unmanage_document_file(
             &params.document_id,
             &params.expected_content_hash,
@@ -523,7 +1036,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             let file_path = self.workspace_root().join(path_from_vds(&d.relative_path));
             let hash = fs::read(&file_path)
                 .ok()
-                .map(|b| format!("sha256:{:x}", sha2::Sha256::digest(&b)));
+                .map(|b| format!("sha256:{}", hex::encode(Sha256::digest(&b))));
             (Some(d.relative_path.clone()), hash)
         } else {
             (None, None)
@@ -542,7 +1055,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         params: RestoreDocumentFileParams,
     ) -> McpResult<DocumentFileMutationResult> {
         let _mutation = self.mutation_lock.lock().unwrap();
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let restored_path = repo
             .restore_document_file(&params.document_id, params.relative_path.as_deref())
             .map_err(metadata_error)?;
@@ -551,7 +1064,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let file_path = self.workspace_root().join(path_from_vds(&restored_path));
         let content_hash = fs::read(&file_path)
             .ok()
-            .map(|b| format!("sha256:{:x}", sha2::Sha256::digest(&b)));
+            .map(|b| format!("sha256:{}", hex::encode(Sha256::digest(&b).as_slice())));
         Ok(DocumentFileMutationResult {
             document_id: params.document_id,
             previous_relative_path: doc.relative_path.clone(),
@@ -573,7 +1086,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
                 message: "document must be managed before it can be moved".to_owned(),
             });
         }
-        if !is_markdown_path_eligible(&self.workspace_root(), &params.new_relative_path)
+        if !is_markdown_path_eligible(self.workspace_root(), &params.new_relative_path)
             .map_err(workspace_error)?
         {
             return Err(McpError {
@@ -585,7 +1098,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             });
         }
         let previous_relative_path = document.relative_path.clone();
-        let relocated = MetadataRepository::open(&self.workspace_root())
+        let relocated = MetadataRepository::open(self.workspace_root())
             .map_err(metadata_error)?
             .relocate_document(
                 &params.document_id,
@@ -788,20 +1301,37 @@ impl VdsMcpSurface for FilesystemVdsServer {
             .collect())
     }
 
-    #[cfg(feature = "semantic-search")]
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn semantic_search_sections(
         &self,
         params: crate::mcp::SemanticSearchSectionsParams,
     ) -> McpResult<Vec<SectionSearchResult>> {
         use crate::semantic::SemanticSearchOptions;
 
-        // Extract or validate query embedding
+        // Get or generate query embedding
         let query_embedding = if let Some(embedding) = params.query_embedding {
+            // Precomputed embedding provided
             embedding
+        } else if let Some(query_text) = params.query {
+            // Generate embedding synchronously from query text
+            let generator = self.embedding_generator.as_ref().ok_or_else(|| McpError {
+                code: McpErrorCode::InvalidInput,
+                message: "Semantic search is not available - no embedding model configured"
+                    .to_owned(),
+            })?;
+
+            let mut gen_lock = generator.lock().unwrap();
+            gen_lock.embed(&query_text).map_err(|e| McpError {
+                code: McpErrorCode::Internal,
+                message: format!("Failed to generate query embedding: {}", e),
+            })?
         } else {
             return Err(McpError {
                 code: McpErrorCode::InvalidInput,
-                message: "semantic_search requires query_embedding parameter. VDS 2.0 does not perform embedding generation - please provide precomputed embeddings.".to_owned(),
+                message: "semantic_search requires either 'query' (text) or 'query_embedding' (precomputed vector)".to_owned(),
             });
         };
 
@@ -812,10 +1342,24 @@ impl VdsMcpSurface for FilesystemVdsServer {
             });
         }
 
+        // Check if embeddings are ready
         let generation = self.generation.read().unwrap();
+        if !generation
+            .embeddings_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(McpError {
+                code: McpErrorCode::Internal,
+                message: "Semantic search is not ready yet - index embeddings are still being generated in the background".to_owned(),
+            });
+        }
 
         // Validate document_id if provided
-        if generation.state.document_by_id(&params.document_id).is_none() {
+        if generation
+            .state
+            .document_by_id(&params.document_id)
+            .is_none()
+        {
             return Err(not_found("document", params.document_id.as_str()));
         }
 
@@ -825,9 +1369,9 @@ impl VdsMcpSurface for FilesystemVdsServer {
             path_prefix: None,
             require_same_model: mcp_options.require_same_model,
             max_results: mcp_options.max_results.unwrap_or(10).max(1) as usize,
-            m: mcp_options.m.map(|v| v as usize),
-            ef_construction: mcp_options.ef_construction.map(|v| v as usize),
-            ef: mcp_options.ef.map(|v| v as usize),
+            m: mcp_options.m.map(|v| v),
+            ef_construction: mcp_options.ef_construction.map(|v| v),
+            ef: mcp_options.ef.map(|v| v),
         };
 
         Ok(generation
@@ -904,7 +1448,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             return Ok(diagnostics);
         }
 
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
 
         // Check 2: each section's current_version has a version file on disk.
         for section in &document.sections {
@@ -986,21 +1530,62 @@ impl VdsMcpSurface for FilesystemVdsServer {
             watcher_active: new_watcher_active,
         };
 
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        let semantic_search_ready = if self.embedding_generator.is_some() {
+            let generation = self.generation.read().unwrap();
+            Some(
+                generation
+                    .embeddings_ready
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        } else {
+            Some(false)
+        };
+
         Ok(WorkspaceInfo {
             workspace: Some(self.workspace_root().to_string_lossy().into_owned()),
             database: "filesystem".to_owned(),
             watcher_active: self.watcher_active(),
             reload_count: 0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            semantic_search_ready,
         })
     }
 
     fn get_workspace(&self, _params: GetWorkspaceParams) -> McpResult<WorkspaceInfo> {
-        let reload_count = self.generation.read().unwrap().reload_count;
+        let generation = self.generation.read().unwrap();
+        let reload_count = generation.reload_count;
+
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        let semantic_search_ready = if self.embedding_generator.is_some() {
+            Some(
+                generation
+                    .embeddings_ready
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        } else {
+            Some(false)
+        };
+
         Ok(WorkspaceInfo {
             workspace: Some(self.workspace_root().to_string_lossy().into_owned()),
             database: "filesystem".to_owned(),
             watcher_active: self.watcher_active(),
             reload_count,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            semantic_search_ready,
         })
     }
 
@@ -1043,8 +1628,17 @@ impl VdsMcpSurface for FilesystemVdsServer {
             .source_spans
             .get(&params.section_id)
             .ok_or_else(|| no_source_span(&params.section_id))?;
-        let separator = if section.content.is_empty() { "" } else { "\n\n" };
-        let new_content = format!("{}{}{}", section.content.trim_end(), separator, params.content.trim_start());
+        let separator = if section.content.is_empty() {
+            ""
+        } else {
+            "\n\n"
+        };
+        let new_content = format!(
+            "{}{}{}",
+            section.content.trim_end(),
+            separator,
+            params.content.trim_start()
+        );
         let new_markdown = apply_content_edit(&markdown, span, &new_content)
             .ok_or_else(|| span_out_of_range(&params.section_id))?;
         self.commit_content_mutation(
@@ -1096,11 +1690,14 @@ impl VdsMcpSurface for FilesystemVdsServer {
             matching: section_matching_record(&section),
             updated_at: now,
         };
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let catalog = repo.load_catalog().map_err(metadata_error)?;
-        let managed = catalog.document_by_id(&params.document_id).ok_or_else(|| {
-            McpError { code: McpErrorCode::NotFound, message: format!("document not managed") }
-        })?;
+        let managed = catalog
+            .document_by_id(&params.document_id)
+            .ok_or_else(|| McpError {
+                code: McpErrorCode::NotFound,
+                message: "document not managed".to_string(),
+            })?;
         let updated_current = CurrentDocumentRecord {
             format_version: METADATA_FORMAT_VERSION,
             content_hash: managed.current.content_hash.clone(),
@@ -1112,7 +1709,8 @@ impl VdsMcpSurface for FilesystemVdsServer {
             &params.document_id,
             &updated_section_record,
             &updated_current,
-        ).map_err(metadata_error)?;
+        )
+        .map_err(metadata_error)?;
         self.reload().map_err(workspace_error)?;
         let doc = self.require_document(&params.document_id)?;
         let updated = self.require_section_from(&doc, &params.section_id)?;
@@ -1125,31 +1723,44 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let mut sections = sections_by_id(&document);
         let root_id = document.document.root.clone();
         let parent_id = params.parent_id.clone().unwrap_or_else(|| root_id.clone());
-        let parent = sections.get(&parent_id).cloned().ok_or_else(|| {
-            not_found("parent section", parent_id.as_str())
-        })?;
+        let parent = sections
+            .get(&parent_id)
+            .cloned()
+            .ok_or_else(|| not_found("parent section", parent_id.as_str()))?;
         let new_id = SectionId::new_v7();
         let ordinal = compute_insert_ordinal(&parent, &params.position);
         insert_child_at(&mut sections, &parent_id, new_id.clone(), ordinal);
         let parent_level = sections.get(&parent_id).map(|s| s.level).unwrap_or(0);
-        let new_level = if parent_id == root_id { 1 } else { (parent_level + 1).min(6) };
+        let new_level = if parent_id == root_id {
+            1
+        } else {
+            (parent_level + 1).min(6)
+        };
         let now = Utc::now();
         let new_version_id = VersionId::new_v7();
-        sections.insert(new_id.clone(), Section {
-            section_id: new_id.clone(),
-            document_id: params.document_id.clone(),
-            parent_id: Some(parent_id),
-            children: Vec::new(),
-            title: params.title.clone(),
-            level: new_level,
-            content: params.content.trim_end().to_owned(),
-            ordinal,
-            current_version: new_version_id.clone(),
-            metadata: SectionMetadata { anchor: None, tags: Vec::new(), summary: None, locked: false },
-            embedding: None,
-            created_at: now,
-            updated_at: now,
-        });
+        sections.insert(
+            new_id.clone(),
+            Section {
+                section_id: new_id.clone(),
+                document_id: params.document_id.clone(),
+                parent_id: Some(parent_id),
+                children: Vec::new(),
+                title: params.title.clone(),
+                level: new_level,
+                content: params.content.trim_end().to_owned(),
+                ordinal,
+                current_version: new_version_id.clone(),
+                metadata: SectionMetadata {
+                    anchor: None,
+                    tags: Vec::new(),
+                    summary: None,
+                    locked: false,
+                },
+                embedding: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
         self.commit_structural(&document, sections, vec![new_id.clone()], "create_section")?;
         let doc = self.require_document(&params.document_id)?;
         let created = self.require_section_from(&doc, &new_id)?;
@@ -1172,23 +1783,40 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let new_version_id = VersionId::new_v7();
         let parent_level = sections.get(&parent_id).map(|s| s.level).unwrap_or(0);
         let root_id = document.document.root.clone();
-        let new_level = if parent_id == root_id { 1 } else { (parent_level + 1).min(6) };
-        sections.insert(new_id.clone(), Section {
-            section_id: new_id.clone(),
-            document_id: params.document_id.clone(),
-            parent_id: Some(parent_id),
-            children: Vec::new(),
-            title: params.title.clone(),
-            level: new_level,
-            content: params.content.trim_end().to_owned(),
-            ordinal,
-            current_version: new_version_id.clone(),
-            metadata: SectionMetadata { anchor: None, tags: Vec::new(), summary: None, locked: false },
-            embedding: None,
-            created_at: now,
-            updated_at: now,
-        });
-        self.commit_structural(&document, sections, vec![new_id.clone()], "insert_section_before")?;
+        let new_level = if parent_id == root_id {
+            1
+        } else {
+            (parent_level + 1).min(6)
+        };
+        sections.insert(
+            new_id.clone(),
+            Section {
+                section_id: new_id.clone(),
+                document_id: params.document_id.clone(),
+                parent_id: Some(parent_id),
+                children: Vec::new(),
+                title: params.title.clone(),
+                level: new_level,
+                content: params.content.trim_end().to_owned(),
+                ordinal,
+                current_version: new_version_id.clone(),
+                metadata: SectionMetadata {
+                    anchor: None,
+                    tags: Vec::new(),
+                    summary: None,
+                    locked: false,
+                },
+                embedding: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        self.commit_structural(
+            &document,
+            sections,
+            vec![new_id.clone()],
+            "insert_section_before",
+        )?;
         let doc = self.require_document(&params.document_id)?;
         let created = self.require_section_from(&doc, &new_id)?;
         Ok(section_info(created))
@@ -1210,23 +1838,40 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let new_version_id = VersionId::new_v7();
         let parent_level = sections.get(&parent_id).map(|s| s.level).unwrap_or(0);
         let root_id = document.document.root.clone();
-        let new_level = if parent_id == root_id { 1 } else { (parent_level + 1).min(6) };
-        sections.insert(new_id.clone(), Section {
-            section_id: new_id.clone(),
-            document_id: params.document_id.clone(),
-            parent_id: Some(parent_id),
-            children: Vec::new(),
-            title: params.title.clone(),
-            level: new_level,
-            content: params.content.trim_end().to_owned(),
-            ordinal,
-            current_version: new_version_id.clone(),
-            metadata: SectionMetadata { anchor: None, tags: Vec::new(), summary: None, locked: false },
-            embedding: None,
-            created_at: now,
-            updated_at: now,
-        });
-        self.commit_structural(&document, sections, vec![new_id.clone()], "insert_section_after")?;
+        let new_level = if parent_id == root_id {
+            1
+        } else {
+            (parent_level + 1).min(6)
+        };
+        sections.insert(
+            new_id.clone(),
+            Section {
+                section_id: new_id.clone(),
+                document_id: params.document_id.clone(),
+                parent_id: Some(parent_id),
+                children: Vec::new(),
+                title: params.title.clone(),
+                level: new_level,
+                content: params.content.trim_end().to_owned(),
+                ordinal,
+                current_version: new_version_id.clone(),
+                metadata: SectionMetadata {
+                    anchor: None,
+                    tags: Vec::new(),
+                    summary: None,
+                    locked: false,
+                },
+                embedding: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        self.commit_structural(
+            &document,
+            sections,
+            vec![new_id.clone()],
+            "insert_section_after",
+        )?;
         let doc = self.require_document(&params.document_id)?;
         let created = self.require_section_from(&doc, &new_id)?;
         Ok(section_info(created))
@@ -1260,7 +1905,10 @@ impl VdsMcpSurface for FilesystemVdsServer {
                 }
             }
             if let Some(parent) = sections.get_mut(&parent_id) {
-                let pos = parent.children.iter().position(|id| id == &params.section_id);
+                let pos = parent
+                    .children
+                    .iter()
+                    .position(|id| id == &params.section_id);
                 if let Some(pos) = pos {
                     let mut new_children = parent.children[..pos].to_vec();
                     new_children.extend_from_slice(&children);
@@ -1292,15 +1940,19 @@ impl VdsMcpSurface for FilesystemVdsServer {
         let root_id = document.document.root.clone();
         let parent_id = params.parent_id.clone().unwrap_or_else(|| root_id.clone());
         let mut sections = sections_by_id(&document);
-        let current_parent = sections.get(&parent_id).cloned().ok_or_else(|| {
-            not_found("parent section", parent_id.as_str())
-        })?;
-        let current_set: std::collections::BTreeSet<_> = current_parent.children.iter().cloned().collect();
-        let requested_set: std::collections::BTreeSet<_> = params.ordered_children.iter().cloned().collect();
+        let current_parent = sections
+            .get(&parent_id)
+            .cloned()
+            .ok_or_else(|| not_found("parent section", parent_id.as_str()))?;
+        let current_set: std::collections::BTreeSet<_> =
+            current_parent.children.iter().cloned().collect();
+        let requested_set: std::collections::BTreeSet<_> =
+            params.ordered_children.iter().cloned().collect();
         if current_set != requested_set {
             return Err(McpError {
                 code: McpErrorCode::InvalidInput,
-                message: "ordered_children must contain exactly the current children of the parent".to_owned(),
+                message: "ordered_children must contain exactly the current children of the parent"
+                    .to_owned(),
             });
         }
         if let Some(parent) = sections.get_mut(&parent_id) {
@@ -1314,7 +1966,9 @@ impl VdsMcpSurface for FilesystemVdsServer {
         self.commit_structural(&document, sections, vec![], "reorder_sections")?;
         let doc = self.require_document(&params.document_id)?;
         let updated_sections = sections_by_id(&doc);
-        Ok(params.ordered_children.iter()
+        Ok(params
+            .ordered_children
+            .iter()
             .filter_map(|id| updated_sections.get(id).cloned().map(section_info))
             .collect())
     }
@@ -1330,7 +1984,10 @@ impl VdsMcpSurface for FilesystemVdsServer {
             });
         }
         let root_id = document.document.root.clone();
-        let new_parent_id = params.new_parent_id.clone().unwrap_or_else(|| root_id.clone());
+        let new_parent_id = params
+            .new_parent_id
+            .clone()
+            .unwrap_or_else(|| root_id.clone());
         if new_parent_id == params.section_id {
             return Err(McpError {
                 code: McpErrorCode::InvalidInput,
@@ -1345,14 +2002,24 @@ impl VdsMcpSurface for FilesystemVdsServer {
         }
         renumber_children(&mut sections, &old_parent_id);
         // Add to new parent
-        let new_parent = sections.get(&new_parent_id).cloned().ok_or_else(|| {
-            not_found("new parent section", new_parent_id.as_str())
-        })?;
+        let new_parent = sections
+            .get(&new_parent_id)
+            .cloned()
+            .ok_or_else(|| not_found("new parent section", new_parent_id.as_str()))?;
         let ordinal = compute_insert_ordinal(&new_parent, &params.position);
-        insert_child_at(&mut sections, &new_parent_id, params.section_id.clone(), ordinal);
+        insert_child_at(
+            &mut sections,
+            &new_parent_id,
+            params.section_id.clone(),
+            ordinal,
+        );
         // Update section's parent and level
         let new_parent_level = sections.get(&new_parent_id).map(|s| s.level).unwrap_or(0);
-        let new_level = if new_parent_id == root_id { 1 } else { (new_parent_level + 1).min(6) };
+        let new_level = if new_parent_id == root_id {
+            1
+        } else {
+            (new_parent_level + 1).min(6)
+        };
         if let Some(sec) = sections.get_mut(&params.section_id) {
             sec.parent_id = Some(new_parent_id.clone());
             sec.level = new_level;
@@ -1377,7 +2044,8 @@ impl VdsMcpSurface for FilesystemVdsServer {
         }
         let parent_id = section.parent_id.clone().unwrap();
         let mut sections = sections_by_id(&document);
-        let grandparent_id = sections.get(&parent_id)
+        let grandparent_id = sections
+            .get(&parent_id)
             .and_then(|p| p.parent_id.clone())
             .ok_or_else(|| McpError {
                 code: McpErrorCode::InvalidInput,
@@ -1391,7 +2059,12 @@ impl VdsMcpSurface for FilesystemVdsServer {
         renumber_children(&mut sections, &parent_id);
         // Insert into grandparent after parent
         let ordinal = parent_ordinal + 1;
-        insert_child_at(&mut sections, &grandparent_id, params.section_id.clone(), ordinal);
+        insert_child_at(
+            &mut sections,
+            &grandparent_id,
+            params.section_id.clone(),
+            ordinal,
+        );
         let new_level = section.level.saturating_sub(1).max(1);
         if let Some(sec) = sections.get_mut(&params.section_id) {
             sec.parent_id = Some(grandparent_id.clone());
@@ -1422,12 +2095,15 @@ impl VdsMcpSurface for FilesystemVdsServer {
         }
         let parent_id = section.parent_id.clone().unwrap();
         let mut sections = sections_by_id(&document);
-        let parent = sections.get(&parent_id).cloned().ok_or_else(|| {
-            not_found("parent section", parent_id.as_str())
-        })?;
+        let parent = sections
+            .get(&parent_id)
+            .cloned()
+            .ok_or_else(|| not_found("parent section", parent_id.as_str()))?;
         // Find the preceding sibling to become the new parent
         let my_ordinal = section.ordinal;
-        let preceding_sibling = parent.children.iter()
+        let preceding_sibling = parent
+            .children
+            .iter()
             .filter_map(|id| sections.get(id))
             .find(|s| s.ordinal + 1 == my_ordinal)
             .map(|s| s.section_id.clone());
@@ -1441,7 +2117,10 @@ impl VdsMcpSurface for FilesystemVdsServer {
         }
         renumber_children(&mut sections, &parent_id);
         // Add as last child of preceding sibling
-        let new_ordinal = sections.get(&new_parent_id).map(|s| s.children.len() as u32).unwrap_or(0);
+        let new_ordinal = sections
+            .get(&new_parent_id)
+            .map(|s| s.children.len() as u32)
+            .unwrap_or(0);
         if let Some(new_parent) = sections.get_mut(&new_parent_id) {
             new_parent.children.push(params.section_id.clone());
         }
@@ -1477,23 +2156,50 @@ impl VdsMcpSurface for FilesystemVdsServer {
                     has_content_change = true;
                 }
                 PatchOp::AppendContent { content } => {
-                    let sep = if current_content.trim_end().is_empty() { "" } else { "\n\n" };
-                    current_content = format!("{}{}{}", current_content.trim_end(), sep, content.trim_start());
+                    let sep = if current_content.trim_end().is_empty() {
+                        ""
+                    } else {
+                        "\n\n"
+                    };
+                    current_content = format!(
+                        "{}{}{}",
+                        current_content.trim_end(),
+                        sep,
+                        content.trim_start()
+                    );
                     has_content_change = true;
                 }
                 PatchOp::PrependContent { content } => {
-                    let sep = if current_content.trim_start().is_empty() { "" } else { "\n\n" };
-                    current_content = format!("{}{}{}", content.trim_end(), sep, current_content.trim_start());
+                    let sep = if current_content.trim_start().is_empty() {
+                        ""
+                    } else {
+                        "\n\n"
+                    };
+                    current_content = format!(
+                        "{}{}{}",
+                        content.trim_end(),
+                        sep,
+                        current_content.trim_start()
+                    );
                     has_content_change = true;
                 }
-                PatchOp::ReplaceRange { start, end, content } => {
+                PatchOp::ReplaceRange {
+                    start,
+                    end,
+                    content,
+                } => {
                     if *end > current_content.len() || *start > *end {
                         return Err(McpError {
                             code: McpErrorCode::InvalidInput,
-                            message: format!("ReplaceRange {start}..{end} is out of bounds for content of length {}", current_content.len()),
+                            message: format!(
+                                "ReplaceRange {start}..{end} is out of bounds for content of length {}",
+                                current_content.len()
+                            ),
                         });
                     }
-                    let mut result = String::with_capacity(current_content.len() - (end - start) + content.len());
+                    let mut result = String::with_capacity(
+                        current_content.len() - (end - start) + content.len(),
+                    );
                     result.push_str(&current_content[..*start]);
                     result.push_str(content);
                     result.push_str(&current_content[*end..]);
@@ -1523,11 +2229,11 @@ impl VdsMcpSurface for FilesystemVdsServer {
                 matching: section_matching_record(&section),
                 updated_at: now,
             };
-            let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+            let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
             let catalog = repo.load_catalog().map_err(metadata_error)?;
-            let managed = catalog.document_by_id(&params.document_id).ok_or_else(|| {
-                not_found("managed document", params.document_id.as_str())
-            })?;
+            let managed = catalog
+                .document_by_id(&params.document_id)
+                .ok_or_else(|| not_found("managed document", params.document_id.as_str()))?;
             let updated_current = CurrentDocumentRecord {
                 format_version: METADATA_FORMAT_VERSION,
                 content_hash: managed.current.content_hash.clone(),
@@ -1539,7 +2245,8 @@ impl VdsMcpSurface for FilesystemVdsServer {
                 &params.document_id,
                 &updated_section_record,
                 &updated_current,
-            ).map_err(metadata_error)?;
+            )
+            .map_err(metadata_error)?;
             self.reload().map_err(workspace_error)?;
             let doc = self.require_document(&params.document_id)?;
             let updated = self.require_section_from(&doc, &params.section_id)?;
@@ -1589,10 +2296,15 @@ impl VdsMcpSurface for FilesystemVdsServer {
             embedding: None,
             created_at: now,
             author: params.options.as_ref().and_then(|o| o.author.clone()),
-            change_summary: params.options.as_ref().and_then(|o| o.change_summary.clone())
+            change_summary: params
+                .options
+                .as_ref()
+                .and_then(|o| o.change_summary.clone())
                 .or_else(|| Some("patch_section".to_owned())),
         };
-        let sections_by_id_map = document.sections.iter()
+        let sections_by_id_map = document
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s))
             .collect::<BTreeMap<_, _>>();
         let ancestry = compute_ancestry(&section.section_id, &sections_by_id_map);
@@ -1610,7 +2322,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             },
             updated_at: now,
         };
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let catalog = repo.load_catalog().map_err(metadata_error)?;
         let managed = catalog
             .document_by_id(&document.document.id)
@@ -1623,7 +2335,8 @@ impl VdsMcpSurface for FilesystemVdsServer {
             "patch_section",
             &new_section_version,
             &updated_section_record,
-        ).map_err(metadata_error)?;
+        )
+        .map_err(metadata_error)?;
         self.reload().map_err(workspace_error)?;
         let doc = self.require_document(&params.document_id)?;
         let updated = self.require_section_from(&doc, &params.section_id)?;
@@ -1672,7 +2385,12 @@ impl VdsMcpSurface for FilesystemVdsServer {
             ordinal: insert_ordinal,
             title: params.new_title.clone(),
             content: second_content.clone(),
-            metadata: SectionMetadata { anchor: None, tags: Vec::new(), summary: None, locked: false },
+            metadata: SectionMetadata {
+                anchor: None,
+                tags: Vec::new(),
+                summary: None,
+                locked: false,
+            },
             children: vec![],
             current_version: new_version_id.clone(),
             embedding: None,
@@ -1683,7 +2401,12 @@ impl VdsMcpSurface for FilesystemVdsServer {
 
         // Insert new section into parent's children list and renumber.
         let effective_parent = parent_id.as_ref().unwrap_or(&document.document.root);
-        insert_child_at(&mut sections, effective_parent, new_section_id.clone(), insert_ordinal);
+        insert_child_at(
+            &mut sections,
+            effective_parent,
+            new_section_id.clone(),
+            insert_ordinal,
+        );
         renumber_children(&mut sections, effective_parent);
 
         self.commit_structural(
@@ -1707,7 +2430,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         &self,
         params: SectionVersionsParams,
     ) -> McpResult<Vec<SectionVersionInfo>> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let ids = repo
             .list_section_versions(&params.document_id, &params.section_id)
             .map_err(metadata_error)?;
@@ -1727,20 +2450,14 @@ impl VdsMcpSurface for FilesystemVdsServer {
         Ok(infos)
     }
 
-    fn get_section_version(
-        &self,
-        params: GetSectionVersionParams,
-    ) -> McpResult<SectionVersion> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+    fn get_section_version(&self, params: GetSectionVersionParams) -> McpResult<SectionVersion> {
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         repo.read_section_version(&params.document_id, &params.section_id, &params.version_id)
             .map_err(metadata_error)
     }
 
-    fn switch_section_version(
-        &self,
-        params: SwitchSectionVersionParams,
-    ) -> McpResult<SectionInfo> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+    fn switch_section_version(&self, params: SwitchSectionVersionParams) -> McpResult<SectionInfo> {
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let historical = repo
             .read_section_version(&params.document_id, &params.section_id, &params.version_id)
             .map_err(metadata_error)?;
@@ -1752,8 +2469,12 @@ impl VdsMcpSurface for FilesystemVdsServer {
             section_id: params.section_id.clone(),
             patch: SectionPatch {
                 operations: vec![
-                    PatchOp::Rename { title: historical.title },
-                    PatchOp::ReplaceContent { content: historical.content },
+                    PatchOp::Rename {
+                        title: historical.title,
+                    },
+                    PatchOp::ReplaceContent {
+                        content: historical.content,
+                    },
                 ],
             },
             options: params.options,
@@ -1762,9 +2483,13 @@ impl VdsMcpSurface for FilesystemVdsServer {
     }
 
     fn diff_section_versions(&self, params: DiffSectionVersionsParams) -> McpResult<DiffResult> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let from_v = repo
-            .read_section_version(&params.document_id, &params.section_id, &params.from_version)
+            .read_section_version(
+                &params.document_id,
+                &params.section_id,
+                &params.from_version,
+            )
             .map_err(metadata_error)?;
         let to_v = repo
             .read_section_version(&params.document_id, &params.section_id, &params.to_version)
@@ -1790,7 +2515,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
             .map(|s| s.current_version.clone())
             .ok_or_else(|| not_found("root section", document.document.root.as_str()))?;
         let sections = document.sections.clone();
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         repo.create_snapshot(
             &params.document_id,
             sections,
@@ -1805,7 +2530,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         &self,
         params: DocumentSnapshotsParams,
     ) -> McpResult<Vec<DocumentSnapshotInfo>> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let snapshots = repo
             .list_snapshots(&params.document_id)
             .map_err(metadata_error)?;
@@ -1828,7 +2553,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
     ) -> McpResult<DocumentInfo> {
         let _mutation = self.mutation_lock.lock().unwrap();
         let document = self.require_managed_document(&params.document_id)?;
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let snapshot = repo
             .read_snapshot(&params.document_id, &params.snapshot_id)
             .map_err(metadata_error)?;
@@ -1840,7 +2565,12 @@ impl VdsMcpSurface for FilesystemVdsServer {
             .map(|s| (s.section_id.clone(), s))
             .collect();
         let new_section_ids: Vec<SectionId> = sections.keys().cloned().collect();
-        self.commit_structural(&document, sections, new_section_ids, "restore_document_snapshot")?;
+        self.commit_structural(
+            &document,
+            sections,
+            new_section_ids,
+            "restore_document_snapshot",
+        )?;
         self.reload().map_err(workspace_error)?;
         let doc = self.require_document(&params.document_id)?;
         Ok(document_info(doc.document))
@@ -1850,7 +2580,7 @@ impl VdsMcpSurface for FilesystemVdsServer {
         &self,
         params: DiffDocumentSnapshotsParams,
     ) -> McpResult<DiffResult> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let from_s = repo
             .read_snapshot(&params.document_id, &params.from_snapshot)
             .map_err(metadata_error)?;
@@ -1859,10 +2589,16 @@ impl VdsMcpSurface for FilesystemVdsServer {
             .map_err(metadata_error)?;
 
         // Produce a diff of rendered Markdown for the two snapshots.
-        let from_sections: BTreeMap<SectionId, Section> =
-            from_s.sections.into_iter().map(|s| (s.section_id.clone(), s)).collect();
-        let to_sections: BTreeMap<SectionId, Section> =
-            to_s.sections.into_iter().map(|s| (s.section_id.clone(), s)).collect();
+        let from_sections: BTreeMap<SectionId, Section> = from_s
+            .sections
+            .into_iter()
+            .map(|s| (s.section_id.clone(), s))
+            .collect();
+        let to_sections: BTreeMap<SectionId, Section> = to_s
+            .sections
+            .into_iter()
+            .map(|s| (s.section_id.clone(), s))
+            .collect();
         // Use the document's current root as anchor (both snapshots share the same root ID).
         let doc = self.require_document(&params.document_id)?;
         let root_id = doc.document.root.clone();
@@ -1886,7 +2622,7 @@ impl FilesystemVdsServer {
             code: McpErrorCode::Storage,
             message: format!("{}: {error}", path.display()),
         })?;
-        let content_hash = format!("sha256:{:x}", Sha256::digest(contents));
+        let content_hash = format!("sha256:{}", hex::encode(Sha256::digest(contents)));
         let relative = Path::new(&document.relative_path);
         let filename = relative
             .file_name()
@@ -1905,7 +2641,7 @@ impl FilesystemVdsServer {
             .map(|parent| parent.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
         let source_matches_metadata = if document.managed {
-            let catalog = MetadataRepository::open(&self.workspace_root())
+            let catalog = MetadataRepository::open(self.workspace_root())
                 .map_err(metadata_error)?
                 .load_catalog()
                 .map_err(metadata_error)?;
@@ -1926,18 +2662,27 @@ impl FilesystemVdsServer {
         })
     }
 
-    fn require_managed_document(&self, document_id: &DocumentId) -> McpResult<MaterializedDocument> {
+    fn require_managed_document(
+        &self,
+        document_id: &DocumentId,
+    ) -> McpResult<MaterializedDocument> {
         let doc = self.require_document(document_id)?;
         if !doc.managed {
             return Err(McpError {
                 code: McpErrorCode::InvalidInput,
-                message: "document must be managed before mutations; call manage_document_file first".to_owned(),
+                message:
+                    "document must be managed before mutations; call manage_document_file first"
+                        .to_owned(),
             });
         }
         Ok(doc)
     }
 
-    fn require_section_from(&self, document: &MaterializedDocument, section_id: &SectionId) -> McpResult<Section> {
+    fn require_section_from(
+        &self,
+        document: &MaterializedDocument,
+        section_id: &SectionId,
+    ) -> McpResult<Section> {
         document
             .sections
             .iter()
@@ -1947,7 +2692,9 @@ impl FilesystemVdsServer {
     }
 
     fn read_markdown_file(&self, document: &MaterializedDocument) -> McpResult<String> {
-        let path = self.workspace_root().join(path_from_vds(&document.relative_path));
+        let path = self
+            .workspace_root()
+            .join(path_from_vds(&document.relative_path));
         fs::read_to_string(&path).map_err(|error| McpError {
             code: McpErrorCode::Storage,
             message: format!("{}: {error}", path.display()),
@@ -1966,7 +2713,7 @@ impl FilesystemVdsServer {
     ) -> McpResult<SectionInfo> {
         let now = Utc::now();
         let new_version_id = VersionId::new_v7();
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let catalog = repo.load_catalog().map_err(metadata_error)?;
         let managed = catalog
             .document_by_id(&document.document.id)
@@ -1982,10 +2729,14 @@ impl FilesystemVdsServer {
             embedding: None,
             created_at: now,
             author: options.as_ref().and_then(|o| o.author.clone()),
-            change_summary: options.as_ref().and_then(|o| o.change_summary.clone())
+            change_summary: options
+                .as_ref()
+                .and_then(|o| o.change_summary.clone())
                 .or_else(|| Some(mutation_kind.to_owned())),
         };
-        let sections_by_id = document.sections.iter()
+        let sections_by_id = document
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s))
             .collect::<BTreeMap<_, _>>();
         let ancestry = compute_ancestry(&section.section_id, &sections_by_id);
@@ -2011,8 +2762,10 @@ impl FilesystemVdsServer {
             mutation_kind,
             &new_section_version,
             &updated_section_record,
-        ).map_err(metadata_error)?;
-        self.reload_incremental(&document.document.id).map_err(workspace_error)?;
+        )
+        .map_err(metadata_error)?;
+        self.reload_incremental(&document.document.id)
+            .map_err(workspace_error)?;
         let doc = self.require_document(&document.document.id)?;
         let updated = self.require_section_from(&doc, &section.section_id)?;
         Ok(section_info(updated))
@@ -2025,7 +2778,7 @@ impl FilesystemVdsServer {
         new_section_ids: Vec<SectionId>,
         mutation_kind: &str,
     ) -> McpResult<()> {
-        let repo = MetadataRepository::open(&self.workspace_root()).map_err(metadata_error)?;
+        let repo = MetadataRepository::open(self.workspace_root()).map_err(metadata_error)?;
         let catalog = repo.load_catalog().map_err(metadata_error)?;
         let managed = catalog
             .document_by_id(&document.document.id)
@@ -2034,21 +2787,22 @@ impl FilesystemVdsServer {
         let root_id = document.document.root.clone();
         let original_markdown = self.read_markdown_file(document)?;
         let use_crlf = detect_crlf(&original_markdown);
-        let new_markdown = apply_line_endings(render_sections_to_markdown(&sections, &root_id), use_crlf);
+        let new_markdown =
+            apply_line_endings(render_sections_to_markdown(&sections, &root_id), use_crlf);
         let now = Utc::now();
         let new_doc_version = crate::document::VersionId::new_v7();
 
         let mut new_versions: Vec<SectionVersion> = Vec::new();
         let mut updated_records: Vec<SectionRecord> = Vec::new();
 
-        let sections_ref: BTreeMap<_, &Section> = sections.iter()
-            .map(|(id, s)| (id.clone(), s))
-            .collect();
+        let sections_ref: BTreeMap<_, &Section> =
+            sections.iter().map(|(id, s)| (id.clone(), s)).collect();
 
         for (id, section) in &sections {
             let is_new = new_section_ids.contains(id);
             let original = document.sections.iter().find(|s| &s.section_id == id);
-            let changed = is_new || original.is_none()
+            let changed = is_new
+                || original.is_none()
                 || original.is_some_and(|o| {
                     o.ordinal != section.ordinal
                         || o.parent_id != section.parent_id
@@ -2106,8 +2860,10 @@ impl FilesystemVdsServer {
             &new_versions,
             &updated_records,
             &updated_current,
-        ).map_err(metadata_error)?;
-        self.reload_incremental(&document.document.id).map_err(workspace_error)
+        )
+        .map_err(metadata_error)?;
+        self.reload_incremental(&document.document.id)
+            .map_err(workspace_error)
     }
 }
 
@@ -2166,8 +2922,8 @@ fn is_relevant_notify_event(event: &notify::Event, workspace_root: &Path) -> boo
         if path.starts_with(&recovery_root) {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.ends_with('~')
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.ends_with('~')
                 || name.starts_with(".~")
                 || name.ends_with(".tmp")
                 || name.ends_with(".TMP")
@@ -2175,10 +2931,9 @@ fn is_relevant_notify_event(event: &notify::Event, workspace_root: &Path) -> boo
                 || name.ends_with(".swx")
                 || name == ".DS_Store"
                 || name == "desktop.ini"
-                || name == "Thumbs.db"
-            {
-                continue;
-            }
+                || name == "Thumbs.db")
+        {
+            continue;
         }
         return true;
     }
@@ -2206,40 +2961,42 @@ fn start_watcher(
     let generation_weak = Arc::downgrade(&generation);
     let _ = std::thread::Builder::new()
         .name("vds-watcher-reload".to_owned())
-        .spawn(move || loop {
-            // Block until the first event signal arrives.
-            if rx.recv().is_err() {
-                break;
-            }
-            // Drain additional signals within the debounce window.
-            let deadline = Instant::now() + Duration::from_millis(300);
+        .spawn(move || {
             loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+                // Block until the first event signal arrives.
+                if rx.recv().is_err() {
                     break;
                 }
-                match rx.recv_timeout(remaining) {
-                    Ok(()) => {}
-                    Err(_) => break,
+                // Drain additional signals within the debounce window.
+                let deadline = Instant::now() + Duration::from_millis(300);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(remaining) {
+                        Ok(()) => {}
+                        Err(_) => break,
+                    }
                 }
-            }
-            // Upgrade the weak reference; exit if the server was dropped.
-            let Some(arc) = generation_weak.upgrade() else {
-                break;
-            };
-            if let Ok(state) = WorkspaceState::load(&workspace_root_reload) {
-                let mut lock = arc.write().unwrap();
-                let reload_count = lock.reload_count + 1;
-                *lock = WorkspaceGeneration::build(state, reload_count);
+                // Upgrade the weak reference; exit if the server was dropped.
+                let Some(arc) = generation_weak.upgrade() else {
+                    break;
+                };
+                if let Ok(state) = WorkspaceState::load(&workspace_root_reload) {
+                    let mut lock = arc.write().unwrap();
+                    let reload_count = lock.reload_count + 1;
+                    *lock = WorkspaceGeneration::build(state, reload_count);
+                }
             }
         });
 
     let workspace_root_filter = workspace_root.clone();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        if let Ok(event) = result {
-            if is_relevant_notify_event(&event, &workspace_root_filter) {
-                let _ = tx.send(());
-            }
+        if let Ok(event) = result
+            && is_relevant_notify_event(&event, &workspace_root_filter)
+        {
+            let _ = tx.send(());
         }
     });
 
@@ -2276,10 +3033,22 @@ fn start_watcher(
 /// Starts the filesystem-authoritative VDS 2 server over MCP stdio.
 pub async fn serve_filesystem_stdio(
     workspace_root: PathBuf,
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    embedding_config: Option<EmbeddingConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = FilesystemVdsServer::open(workspace_root)?
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let service = FilesystemVdsServer::open(
+        workspace_root,
+        #[cfg(all(
+            feature = "semantic-search",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        embedding_config,
+    )?
+    .serve(rmcp::transport::stdio())
+    .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -2289,6 +3058,11 @@ pub async fn serve_filesystem_http(
     workspace_root: PathBuf,
     bind: String,
     path: String,
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    embedding_config: Option<EmbeddingConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = format!("http://{bind}{path}");
     eprintln!(
@@ -2298,13 +3072,25 @@ pub async fn serve_filesystem_http(
     eprintln!("Workspace: {}", workspace_root.display());
     eprintln!("Endpoint: {endpoint}");
     let workspace_root = Arc::new(workspace_root);
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    let embedding_config = Arc::new(embedding_config);
     let service: rmcp::transport::streamable_http_server::tower::StreamableHttpService<
         FilesystemVdsServer,
         rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
     > = rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
         move || {
-            FilesystemVdsServer::open((*workspace_root).clone())
-                .map_err(|error| std::io::Error::other(error.to_string()))
+            FilesystemVdsServer::open(
+                (*workspace_root).clone(),
+                #[cfg(all(
+                    feature = "semantic-search",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
+                (*embedding_config).clone(),
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))
         },
         Default::default(),
         rmcp::transport::StreamableHttpServerConfig::default(),
@@ -2476,21 +3262,36 @@ fn compute_diff(from_label: &str, from_text: &str, to_label: &str, to_text: &str
         for k in hunk_start..hunk_end {
             match &changes[k] {
                 LineChange::Same(t) => {
-                    lines.push(DiffLine { kind: DiffLineKind::Context, text: (*t).to_owned() });
+                    lines.push(DiffLine {
+                        kind: DiffLineKind::Context,
+                        text: (*t).to_owned(),
+                    });
                     old_lines += 1;
                     new_lines += 1;
                 }
                 LineChange::Removed(t) => {
-                    lines.push(DiffLine { kind: DiffLineKind::Removed, text: (*t).to_owned() });
+                    lines.push(DiffLine {
+                        kind: DiffLineKind::Removed,
+                        text: (*t).to_owned(),
+                    });
                     old_lines += 1;
                 }
                 LineChange::Added(t) => {
-                    lines.push(DiffLine { kind: DiffLineKind::Added, text: (*t).to_owned() });
+                    lines.push(DiffLine {
+                        kind: DiffLineKind::Added,
+                        text: (*t).to_owned(),
+                    });
                     new_lines += 1;
                 }
             }
         }
-        hunks.push(DiffHunk { old_start, old_lines, new_start, new_lines, lines });
+        hunks.push(DiffHunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            lines,
+        });
         i = hunk_end;
     }
 
@@ -2514,8 +3315,12 @@ fn line_diff<'a>(from: &[&'a str], to: &[&'a str]) -> Vec<LineChange<'a>> {
     let m = to.len();
     // dp[i][j] = minimum edit distance reaching from[i], to[j].
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for i in 0..=n { dp[i][0] = i; }
-    for j in 0..=m { dp[0][j] = j; }
+    for i in 0..=n {
+        dp[i][0] = i;
+    }
+    for j in 0..=m {
+        dp[0][j] = j;
+    }
     for i in 1..=n {
         for j in 1..=m {
             if from[i - 1] == to[j - 1] {
@@ -2531,7 +3336,8 @@ fn line_diff<'a>(from: &[&'a str], to: &[&'a str]) -> Vec<LineChange<'a>> {
     while i > 0 || j > 0 {
         if i > 0 && j > 0 && from[i - 1] == to[j - 1] {
             result.push(LineChange::Same(from[i - 1]));
-            i -= 1; j -= 1;
+            i -= 1;
+            j -= 1;
         } else if j > 0 && (i == 0 || dp[i][j - 1] <= dp[i - 1][j]) {
             result.push(LineChange::Added(to[j - 1]));
             j -= 1;
@@ -2545,18 +3351,18 @@ fn line_diff<'a>(from: &[&'a str], to: &[&'a str]) -> Vec<LineChange<'a>> {
 }
 
 fn check_version(section: &Section, options: &Option<EditOptions>) -> McpResult<()> {
-    if let Some(expected) = options.as_ref().and_then(|o| o.expected_version.as_ref()) {
-        if *expected != section.current_version {
-            return Err(McpError {
-                code: McpErrorCode::Conflict,
-                message: format!(
-                    "section {} version conflict: expected {}, found {}",
-                    section.section_id.as_str(),
-                    expected.as_str(),
-                    section.current_version.as_str()
-                ),
-            });
-        }
+    if let Some(expected) = options.as_ref().and_then(|o| o.expected_version.as_ref())
+        && *expected != section.current_version
+    {
+        return Err(McpError {
+            code: McpErrorCode::Conflict,
+            message: format!(
+                "section {} version conflict: expected {}, found {}",
+                section.section_id.as_str(),
+                expected.as_str(),
+                section.current_version.as_str()
+            ),
+        });
     }
     Ok(())
 }
@@ -2564,14 +3370,20 @@ fn check_version(section: &Section, options: &Option<EditOptions>) -> McpResult<
 fn no_source_span(section_id: &SectionId) -> McpError {
     McpError {
         code: McpErrorCode::Internal,
-        message: format!("source span not available for section {}", section_id.as_str()),
+        message: format!(
+            "source span not available for section {}",
+            section_id.as_str()
+        ),
     }
 }
 
 fn span_out_of_range(section_id: &SectionId) -> McpError {
     McpError {
         code: McpErrorCode::Internal,
-        message: format!("source span is out of range for section {}", section_id.as_str()),
+        message: format!(
+            "source span is out of range for section {}",
+            section_id.as_str()
+        ),
     }
 }
 
@@ -2587,7 +3399,7 @@ fn section_matching_record(section: &Section) -> SectionMatchingRecord {
 
 fn sha256_str(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 /// Returns true if the Markdown file uses CRLF line endings (Windows-style).
@@ -2600,9 +3412,9 @@ fn apply_line_endings(markdown: String, use_crlf: bool) -> String {
     if use_crlf {
         // Only convert bare LF (not already preceded by CR).
         let mut result = String::with_capacity(markdown.len() + markdown.len() / 20);
-        let mut chars = markdown.chars().peekable();
+        let chars = markdown.chars();
         let mut prev_was_cr = false;
-        while let Some(c) = chars.next() {
+        for c in chars {
             if c == '\n' && !prev_was_cr {
                 result.push('\r');
             }
@@ -2620,10 +3432,14 @@ fn compute_ancestry(
     sections: &BTreeMap<SectionId, &Section>,
 ) -> Vec<String> {
     let mut titles = Vec::new();
-    let Some(section) = sections.get(section_id) else { return titles };
+    let Some(section) = sections.get(section_id) else {
+        return titles;
+    };
     let mut parent_id = section.parent_id.as_ref();
     while let Some(id) = parent_id {
-        let Some(parent) = sections.get(id) else { break };
+        let Some(parent) = sections.get(id) else {
+            break;
+        };
         if parent.parent_id.is_some() {
             titles.push(parent.title.clone());
         }
@@ -2639,16 +3455,18 @@ fn compute_insert_ordinal(parent: &Section, position: &Option<crate::mcp::Insert
         None | Some(InsertPosition::Last) => parent.children.len() as u32,
         Some(InsertPosition::First) => 0,
         Some(InsertPosition::Index(i)) => (*i).min(parent.children.len() as u32),
-        Some(InsertPosition::Before(sibling_id)) => {
-            parent.children.iter().position(|id| id == sibling_id)
-                .map(|i| i as u32)
-                .unwrap_or(parent.children.len() as u32)
-        }
-        Some(InsertPosition::After(sibling_id)) => {
-            parent.children.iter().position(|id| id == sibling_id)
-                .map(|i| i as u32 + 1)
-                .unwrap_or(parent.children.len() as u32)
-        }
+        Some(InsertPosition::Before(sibling_id)) => parent
+            .children
+            .iter()
+            .position(|id| id == sibling_id)
+            .map(|i| i as u32)
+            .unwrap_or(parent.children.len() as u32),
+        Some(InsertPosition::After(sibling_id)) => parent
+            .children
+            .iter()
+            .position(|id| id == sibling_id)
+            .map(|i| i as u32 + 1)
+            .unwrap_or(parent.children.len() as u32),
     }
 }
 
@@ -2659,7 +3477,9 @@ fn insert_child_at(
     ordinal: u32,
 ) {
     let children = {
-        let Some(parent) = sections.get_mut(parent_id) else { return };
+        let Some(parent) = sections.get_mut(parent_id) else {
+            return;
+        };
         let ordinal = ordinal.min(parent.children.len() as u32) as usize;
         parent.children.insert(ordinal, child_id.clone());
         parent.children.clone()
@@ -2668,7 +3488,10 @@ fn insert_child_at(
 }
 
 fn renumber_children(sections: &mut BTreeMap<SectionId, Section>, parent_id: &SectionId) {
-    let children = sections.get(parent_id).map(|p| p.children.clone()).unwrap_or_default();
+    let children = sections
+        .get(parent_id)
+        .map(|p| p.children.clone())
+        .unwrap_or_default();
     renumber_children_vec(sections, &children);
 }
 
@@ -2685,7 +3508,10 @@ fn update_descendant_levels(
     section_id: &SectionId,
     parent_level: u8,
 ) {
-    let children = sections.get(section_id).map(|s| s.children.clone()).unwrap_or_default();
+    let children = sections
+        .get(section_id)
+        .map(|s| s.children.clone())
+        .unwrap_or_default();
     for child_id in children {
         let new_level = (parent_level + 1).min(6);
         if let Some(child) = sections.get_mut(&child_id) {
@@ -2791,7 +3617,15 @@ mod tests {
     #[test]
     fn exposes_filesystem_reads_and_indexed_search() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
         let documents = server
             .list_documents(ListDocumentsParams::default())
             .unwrap();
@@ -2885,7 +3719,15 @@ mod tests {
     #[test]
     fn moves_and_renames_managed_markdown_with_hash_guards() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
         let document = server
             .list_documents(ListDocumentsParams::default())
             .unwrap()
@@ -2942,36 +3784,71 @@ mod tests {
     #[test]
     fn update_and_rename_section_surgically_edits_markdown() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        let managed = server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        let managed = server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         assert!(managed.managed);
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
-        let storage_entry = toc[0].children.iter().find(|e| e.title == "Storage").expect("Storage section");
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
+        let storage_entry = toc[0]
+            .children
+            .iter()
+            .find(|e| e.title == "Storage")
+            .expect("Storage section");
         let storage_id = storage_entry.section_id.clone();
 
-        let updated = server.update_section(UpdateSectionParams {
-            document_id: document.id.clone(),
-            section_id: storage_id.clone(),
-            content: "Updated storage content.".to_owned(),
-            options: None,
-        }).unwrap();
+        let updated = server
+            .update_section(UpdateSectionParams {
+                document_id: document.id.clone(),
+                section_id: storage_id.clone(),
+                content: "Updated storage content.".to_owned(),
+                options: None,
+            })
+            .unwrap();
         assert_eq!(updated.title, "Storage");
 
-        let rendered = server.render_document_markdown(RenderDocumentMarkdownParams { document_id: document.id.clone() }).unwrap();
+        let rendered = server
+            .render_document_markdown(RenderDocumentMarkdownParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         assert!(rendered.contains("Updated storage content."));
         assert!(rendered.contains("## Storage"));
         assert!(rendered.contains("# Architecture"));
 
-        let renamed = server.rename_section(RenameSectionParams {
-            document_id: document.id.clone(),
-            section_id: storage_id.clone(),
-            new_title: "Persistence".to_owned(),
-            options: None,
-        }).unwrap();
+        let renamed = server
+            .rename_section(RenameSectionParams {
+                document_id: document.id.clone(),
+                section_id: storage_id.clone(),
+                new_title: "Persistence".to_owned(),
+                options: None,
+            })
+            .unwrap();
         assert_eq!(renamed.title, "Persistence");
-        let rendered2 = server.render_document_markdown(RenderDocumentMarkdownParams { document_id: document.id.clone() }).unwrap();
+        let rendered2 = server
+            .render_document_markdown(RenderDocumentMarkdownParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         assert!(rendered2.contains("## Persistence"));
         assert!(!rendered2.contains("## Storage"));
     }
@@ -2979,88 +3856,161 @@ mod tests {
     #[test]
     fn create_and_remove_sections_update_markdown_structurally() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let arch_id = toc[0].section_id.clone();
 
-        let created = server.create_section(CreateSectionParams {
-            document_id: document.id.clone(),
-            parent_id: Some(arch_id.clone()),
-            title: "Caching".to_owned(),
-            content: "Cache details.".to_owned(),
-            position: None,
-        }).unwrap();
+        let created = server
+            .create_section(CreateSectionParams {
+                document_id: document.id.clone(),
+                parent_id: Some(arch_id.clone()),
+                title: "Caching".to_owned(),
+                content: "Cache details.".to_owned(),
+                position: None,
+            })
+            .unwrap();
         assert_eq!(created.title, "Caching");
 
-        let rendered = server.render_document_markdown(RenderDocumentMarkdownParams { document_id: document.id.clone() }).unwrap();
+        let rendered = server
+            .render_document_markdown(RenderDocumentMarkdownParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         assert!(rendered.contains("## Caching"));
         assert!(rendered.contains("Cache details."));
 
-        let removed = server.remove_section(RemoveSectionParams {
-            document_id: document.id.clone(),
-            section_id: created.section_id.clone(),
-            remove_children: false,
-            options: None,
-        }).unwrap();
+        let removed = server
+            .remove_section(RemoveSectionParams {
+                document_id: document.id.clone(),
+                section_id: created.section_id.clone(),
+                remove_children: false,
+                options: None,
+            })
+            .unwrap();
         assert_eq!(removed.section_id, created.section_id);
 
-        let rendered2 = server.render_document_markdown(RenderDocumentMarkdownParams { document_id: document.id.clone() }).unwrap();
+        let rendered2 = server
+            .render_document_markdown(RenderDocumentMarkdownParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         assert!(!rendered2.contains("## Caching"));
     }
 
     #[test]
     fn append_and_set_metadata_work_on_managed_section() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let storage_id = toc[0].children[0].section_id.clone();
 
-        server.append_to_section(AppendToSectionParams {
-            document_id: document.id.clone(),
-            section_id: storage_id.clone(),
-            content: "Appended paragraph.".to_owned(),
-            options: None,
-        }).unwrap();
+        server
+            .append_to_section(AppendToSectionParams {
+                document_id: document.id.clone(),
+                section_id: storage_id.clone(),
+                content: "Appended paragraph.".to_owned(),
+                options: None,
+            })
+            .unwrap();
 
-        let section = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: storage_id.clone(),
-        }).unwrap();
+        let section = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: storage_id.clone(),
+            })
+            .unwrap();
         assert!(section.content.contains("Appended paragraph."));
         assert!(section.content.contains("Filesystem metadata search."));
 
-        let metadata_updated = server.set_section_metadata(SetSectionMetadataParams {
-            document_id: document.id.clone(),
-            section_id: storage_id.clone(),
-            metadata: crate::document::SectionMetadata { anchor: None, tags: vec!["storage".to_owned()], summary: Some("storage summary".to_owned()), locked: false },
-            options: None,
-        }).unwrap();
+        let metadata_updated = server
+            .set_section_metadata(SetSectionMetadataParams {
+                document_id: document.id.clone(),
+                section_id: storage_id.clone(),
+                metadata: crate::document::SectionMetadata {
+                    anchor: None,
+                    tags: vec!["storage".to_owned()],
+                    summary: Some("storage summary".to_owned()),
+                    locked: false,
+                },
+                options: None,
+            })
+            .unwrap();
         assert_eq!(metadata_updated.title, "Storage");
 
-        let section2 = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: storage_id,
-        }).unwrap();
+        let section2 = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: storage_id,
+            })
+            .unwrap();
         assert_eq!(section2.metadata.tags, vec!["storage".to_owned()]);
     }
 
     #[test]
     fn create_document_creates_file_and_promotes_it() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
 
-        let info = server.create_document(CreateDocumentParams {
-            relative_path: Some("notes/new-doc.md".to_owned()),
-            name: None,
-            title: Some("New Doc".to_owned()),
-            initial_content: Some("# New Doc\n\nInitial content.\n".to_owned()),
-        }).unwrap();
+        let info = server
+            .create_document(CreateDocumentParams {
+                relative_path: Some("notes/new-doc.md".to_owned()),
+                name: None,
+                title: Some("New Doc".to_owned()),
+                initial_content: Some("# New Doc\n\nInitial content.\n".to_owned()),
+            })
+            .unwrap();
 
         assert_eq!(info.title, Some("New Doc".to_owned()));
         let path = workspace.0.join("notes").join("new-doc.md");
@@ -3085,115 +4035,216 @@ mod tests {
     #[test]
     fn remove_document_file_soft_deletes_file_and_leaves_tombstone() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let location = server.get_document_location(GetDocumentLocationParams {
-            document_id: document.id.clone(),
-        }).unwrap();
-        let md_path = workspace.0.join(location.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let location = server
+            .get_document_location(GetDocumentLocationParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
+        let md_path = workspace.0.join(
+            location
+                .relative_path
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
         assert!(md_path.exists());
 
-        let result = server.remove_document_file(RemoveDocumentFileParams {
-            document_id: document.id.clone(),
-            expected_content_hash: location.content_hash.clone(),
-        }).unwrap();
+        let result = server
+            .remove_document_file(RemoveDocumentFileParams {
+                document_id: document.id.clone(),
+                expected_content_hash: location.content_hash.clone(),
+            })
+            .unwrap();
 
         assert_eq!(result.relative_path, None, "no active path after removal");
         assert!(!md_path.exists(), "Markdown file must be deleted");
 
         // Tombstone must exist in inactive archive.
-        let tombstone_path = workspace.0
+        let tombstone_path = workspace
+            .0
             .join(".vds/inactive")
             .join(document.id.as_str())
             .join("tombstone.json");
         assert!(tombstone_path.exists(), "tombstone written");
 
         // Document must no longer appear in the workspace.
-        let docs = server.list_documents(ListDocumentsParams::default()).unwrap();
-        assert!(!docs.iter().any(|d| d.id == document.id), "removed doc not in listing");
+        let docs = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap();
+        assert!(
+            !docs.iter().any(|d| d.id == document.id),
+            "removed doc not in listing"
+        );
     }
 
     #[test]
     fn unmanage_document_file_leaves_markdown_and_archives_history() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let location = server.get_document_location(GetDocumentLocationParams {
-            document_id: document.id.clone(),
-        }).unwrap();
-        let md_path = workspace.0.join(location.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let location = server
+            .get_document_location(GetDocumentLocationParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
+        let md_path = workspace.0.join(
+            location
+                .relative_path
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
         assert!(md_path.exists());
 
-        let result = server.unmanage_document_file(UnmanageDocumentFileParams {
-            document_id: document.id.clone(),
-            expected_content_hash: location.content_hash.clone(),
-            archive_history: true,
-        }).unwrap();
+        let result = server
+            .unmanage_document_file(UnmanageDocumentFileParams {
+                document_id: document.id.clone(),
+                expected_content_hash: location.content_hash.clone(),
+                archive_history: true,
+            })
+            .unwrap();
 
-        assert!(result.relative_path.is_some(), "Markdown file path still returned");
+        assert!(
+            result.relative_path.is_some(),
+            "Markdown file path still returned"
+        );
         assert!(md_path.exists(), "Markdown file must NOT be deleted");
 
         // Tombstone and archived metadata must exist.
         let inactive_dir = workspace.0.join(".vds/inactive").join(document.id.as_str());
-        assert!(inactive_dir.join("tombstone.json").exists(), "tombstone written");
-        assert!(inactive_dir.join("archive/metadata/document.json").exists(), "history archived");
+        assert!(
+            inactive_dir.join("tombstone.json").exists(),
+            "tombstone written"
+        );
+        assert!(
+            inactive_dir.join("archive/metadata/document.json").exists(),
+            "history archived"
+        );
 
         // Active VDS metadata directory must be gone.
-        let active_dir = workspace.0.join(".vds/documents").join(document.id.as_str());
+        let active_dir = workspace
+            .0
+            .join(".vds/documents")
+            .join(document.id.as_str());
         assert!(!active_dir.exists(), "active metadata removed");
 
         // The file still appears as unmanaged in the workspace.
-        let docs = server.list_documents(ListDocumentsParams::default()).unwrap();
+        let docs = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap();
         let unmanaged = docs.iter().find(|d| d.id == document.id);
         // After unmanage, the doc may appear as unmanaged or not at all depending on reload.
         // What matters is it's no longer managed.
         if let Some(d) = unmanaged {
             let mat = server.require_document(&d.id).unwrap();
-            assert!(!mat.managed, "document must be unmanaged after unmanage_document_file");
+            assert!(
+                !mat.managed,
+                "document must be unmanaged after unmanage_document_file"
+            );
         }
     }
 
     #[test]
     fn restore_document_file_revives_removed_document() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let location = server.get_document_location(GetDocumentLocationParams {
-            document_id: document.id.clone(),
-        }).unwrap();
+        let location = server
+            .get_document_location(GetDocumentLocationParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let original_path = location.relative_path.clone();
-        let md_path = workspace.0.join(original_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let md_path = workspace
+            .0
+            .join(original_path.replace('/', std::path::MAIN_SEPARATOR_STR));
 
         // Soft-delete.
-        server.remove_document_file(RemoveDocumentFileParams {
-            document_id: document.id.clone(),
-            expected_content_hash: location.content_hash.clone(),
-        }).unwrap();
+        server
+            .remove_document_file(RemoveDocumentFileParams {
+                document_id: document.id.clone(),
+                expected_content_hash: location.content_hash.clone(),
+            })
+            .unwrap();
         assert!(!md_path.exists(), "Markdown deleted after remove");
 
         // Verify inactive archive exists.
         let inactive_dir = workspace.0.join(".vds/inactive").join(document.id.as_str());
         assert!(inactive_dir.join("tombstone.json").exists());
-        assert!(inactive_dir.join("archive/content.md").exists(), "content archived");
+        assert!(
+            inactive_dir.join("archive/content.md").exists(),
+            "content archived"
+        );
 
         // Restore.
-        let result = server.restore_document_file(RestoreDocumentFileParams {
-            document_id: document.id.clone(),
-            relative_path: None,
-        }).unwrap();
+        let result = server
+            .restore_document_file(RestoreDocumentFileParams {
+                document_id: document.id.clone(),
+                relative_path: None,
+            })
+            .unwrap();
 
-        assert_eq!(result.relative_path.as_deref(), Some(original_path.as_str()));
+        assert_eq!(
+            result.relative_path.as_deref(),
+            Some(original_path.as_str())
+        );
         assert!(md_path.exists(), "Markdown recreated after restore");
         assert!(!inactive_dir.exists(), "inactive archive cleaned up");
 
         // Document is active and managed again.
-        let active_dir = workspace.0.join(".vds/documents").join(document.id.as_str());
+        let active_dir = workspace
+            .0
+            .join(".vds/documents")
+            .join(document.id.as_str());
         assert!(active_dir.exists(), "active metadata restored");
         let mat = server.require_document(&document.id).unwrap();
         assert!(mat.managed, "document is managed after restore");
@@ -3213,24 +4264,48 @@ mod tests {
         let crlf_markdown = "# Architecture\r\n\r\nOverview.\r\n\r\n## Storage\r\n\r\nFilesystem metadata search.\r\n";
         fs::write(root.join("docs/architecture.md"), crlf_markdown.as_bytes()).unwrap();
 
-        let server = FilesystemVdsServer::open(&root).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &root,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
         // A structural mutation (create_section) must preserve CRLF.
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let root_id = toc[0].section_id.clone();
-        server.create_section(CreateSectionParams {
-            document_id: document.id.clone(),
-            parent_id: Some(root_id),
-            title: "New Section".to_owned(),
-            content: "New content.".to_owned(),
-            position: None,
-        }).unwrap();
+        server
+            .create_section(CreateSectionParams {
+                document_id: document.id.clone(),
+                parent_id: Some(root_id),
+                title: "New Section".to_owned(),
+                content: "New content.".to_owned(),
+                position: None,
+            })
+            .unwrap();
 
         let written = fs::read(root.join("docs/architecture.md")).unwrap();
         let written_str = String::from_utf8(written).unwrap();
-        assert!(written_str.contains("\r\n"), "CRLF must be preserved after structural mutation");
+        assert!(
+            written_str.contains("\r\n"),
+            "CRLF must be preserved after structural mutation"
+        );
         // Every \n must be preceded by \r — no bare LF should exist.
         let bare_lf = written_str.replace("\r\n", "").contains('\n');
         assert!(!bare_lf, "no bare LF in CRLF file: {:?}", written_str);
@@ -3244,83 +4319,150 @@ mod tests {
         use crate::mcp::PatchSectionParams;
 
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let section_id = toc[0].children[0].section_id.clone(); // "Storage"
 
         // ReplaceContent + Rename in a single patch.
-        let info = server.patch_section(PatchSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            patch: SectionPatch {
-                operations: vec![
-                    PatchOp::ReplaceContent { content: "New storage content.".to_owned() },
-                    PatchOp::Rename { title: "Storage (updated)".to_owned() },
-                ],
-            },
-            options: None,
-        }).unwrap();
+        let info = server
+            .patch_section(PatchSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                patch: SectionPatch {
+                    operations: vec![
+                        PatchOp::ReplaceContent {
+                            content: "New storage content.".to_owned(),
+                        },
+                        PatchOp::Rename {
+                            title: "Storage (updated)".to_owned(),
+                        },
+                    ],
+                },
+                options: None,
+            })
+            .unwrap();
         assert_eq!(info.title, "Storage (updated)");
 
-        let section = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let section = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         assert_eq!(section.content.trim(), "New storage content.");
         assert_eq!(section.title, "Storage (updated)");
 
         // AppendContent followed by PrependContent.
-        server.patch_section(PatchSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            patch: SectionPatch {
-                operations: vec![
-                    PatchOp::AppendContent { content: "Appended.".to_owned() },
-                    PatchOp::PrependContent { content: "Prepended.".to_owned() },
-                ],
-            },
-            options: None,
-        }).unwrap();
+        server
+            .patch_section(PatchSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                patch: SectionPatch {
+                    operations: vec![
+                        PatchOp::AppendContent {
+                            content: "Appended.".to_owned(),
+                        },
+                        PatchOp::PrependContent {
+                            content: "Prepended.".to_owned(),
+                        },
+                    ],
+                },
+                options: None,
+            })
+            .unwrap();
 
-        let section2 = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
-        assert!(section2.content.starts_with("Prepended."), "expected prepend at start: {:?}", section2.content);
-        assert!(section2.content.ends_with("Appended."), "expected append at end: {:?}", section2.content);
+        let section2 = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            section2.content.starts_with("Prepended."),
+            "expected prepend at start: {:?}",
+            section2.content
+        );
+        assert!(
+            section2.content.ends_with("Appended."),
+            "expected append at end: {:?}",
+            section2.content
+        );
 
         // SetMetadata-only patch should not rewrite Markdown.
         let markdown_before = std::fs::read_to_string(
             workspace.0.join(
-                server.get_document_location(GetDocumentLocationParams { document_id: document.id.clone() })
-                    .unwrap().relative_path.replace('/', std::path::MAIN_SEPARATOR_STR)
-            )
-        ).unwrap();
-        server.patch_section(PatchSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            patch: SectionPatch {
-                operations: vec![
-                    PatchOp::SetMetadata { metadata: SectionMetadata { anchor: None, tags: vec!["patched".to_owned()], summary: None, locked: false } },
-                ],
-            },
-            options: None,
-        }).unwrap();
+                server
+                    .get_document_location(GetDocumentLocationParams {
+                        document_id: document.id.clone(),
+                    })
+                    .unwrap()
+                    .relative_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            ),
+        )
+        .unwrap();
+        server
+            .patch_section(PatchSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                patch: SectionPatch {
+                    operations: vec![PatchOp::SetMetadata {
+                        metadata: SectionMetadata {
+                            anchor: None,
+                            tags: vec!["patched".to_owned()],
+                            summary: None,
+                            locked: false,
+                        },
+                    }],
+                },
+                options: None,
+            })
+            .unwrap();
         let markdown_after = std::fs::read_to_string(
             workspace.0.join(
-                server.get_document_location(GetDocumentLocationParams { document_id: document.id.clone() })
-                    .unwrap().relative_path.replace('/', std::path::MAIN_SEPARATOR_STR)
-            )
-        ).unwrap();
-        assert_eq!(markdown_before, markdown_after, "metadata-only patch must not change the Markdown file");
+                server
+                    .get_document_location(GetDocumentLocationParams {
+                        document_id: document.id.clone(),
+                    })
+                    .unwrap()
+                    .relative_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            markdown_before, markdown_after,
+            "metadata-only patch must not change the Markdown file"
+        );
 
-        let section3 = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let section3 = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         assert_eq!(section3.metadata.tags, vec!["patched".to_owned()]);
     }
 
@@ -3329,209 +4471,378 @@ mod tests {
         use crate::mcp::SplitSectionParams;
 
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let section_id = toc[0].children[0].section_id.clone(); // "Storage"
 
-        let original_section = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let original_section = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         // Split at the first space to keep a clean word boundary.
-        let split_at = original_section.content.find(' ').unwrap_or(original_section.content.len());
+        let split_at = original_section
+            .content
+            .find(' ')
+            .unwrap_or(original_section.content.len());
 
-        let result = server.split_section(SplitSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            split_at,
-            new_title: "Storage (continued)".to_owned(),
-        }).unwrap();
+        let result = server
+            .split_section(SplitSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                split_at,
+                new_title: "Storage (continued)".to_owned(),
+            })
+            .unwrap();
 
         assert_eq!(result.original.section_id, section_id);
         assert_ne!(result.created.section_id, section_id);
         assert_eq!(result.created.title, "Storage (continued)");
 
         // The two halves should cover the original content.
-        let first = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
-        let second = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: result.created.section_id.clone(),
-        }).unwrap();
+        let first = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
+        let second = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: result.created.section_id.clone(),
+            })
+            .unwrap();
         let original_trimmed = original_section.content.trim();
-        assert!(original_trimmed.starts_with(first.content.trim()), "first half should be prefix of original");
-        assert!(original_trimmed.ends_with(second.content.trim()), "second half should be suffix of original");
+        assert!(
+            original_trimmed.starts_with(first.content.trim()),
+            "first half should be prefix of original"
+        );
+        assert!(
+            original_trimmed.ends_with(second.content.trim()),
+            "second half should be suffix of original"
+        );
 
         // The new section must appear immediately after the original in the TOC.
-        let toc2 = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc2 = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let storage_parent = &toc2[0];
-        let positions: Vec<&SectionId> = storage_parent.children.iter()
+        let positions: Vec<&SectionId> = storage_parent
+            .children
+            .iter()
             .map(|e| &e.section_id)
             .collect();
         let orig_pos = positions.iter().position(|id| *id == &section_id).unwrap();
-        let new_pos = positions.iter().position(|id| *id == &result.created.section_id).unwrap();
-        assert_eq!(new_pos, orig_pos + 1, "new section must be immediately after original");
+        let new_pos = positions
+            .iter()
+            .position(|id| *id == &result.created.section_id)
+            .unwrap();
+        assert_eq!(
+            new_pos,
+            orig_pos + 1,
+            "new section must be immediately after original"
+        );
     }
 
     #[test]
     fn section_versions_and_get_version_return_history() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let section_id = toc[0].section_id.clone();
 
         // Promote writes initial version; edit to produce a second.
-        server.update_section(UpdateSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            content: "Updated content.".to_owned(),
-            options: None,
-        }).unwrap();
+        server
+            .update_section(UpdateSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                content: "Updated content.".to_owned(),
+                options: None,
+            })
+            .unwrap();
 
-        let versions = server.section_versions(SectionVersionsParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
-        assert!(versions.len() >= 2, "initial + edited versions expected, got {}", versions.len());
+        let versions = server
+            .section_versions(SectionVersionsParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            versions.len() >= 2,
+            "initial + edited versions expected, got {}",
+            versions.len()
+        );
 
-        let first_version = server.get_section_version(GetSectionVersionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            version_id: versions[0].version_id.clone(),
-        }).unwrap();
+        let first_version = server
+            .get_section_version(GetSectionVersionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                version_id: versions[0].version_id.clone(),
+            })
+            .unwrap();
         assert_eq!(first_version.section_id, section_id);
-        assert!(!first_version.content.is_empty(), "version must have content");
+        assert!(
+            !first_version.content.is_empty(),
+            "version must have content"
+        );
     }
 
     #[test]
     fn switch_section_version_restores_historical_content() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let section_id = toc[0].section_id.clone();
-        let initial_section = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let initial_section = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         let original_content = initial_section.content.clone();
 
         // Edit to produce a new version.
-        server.update_section(UpdateSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            content: "Completely different content.".to_owned(),
-            options: None,
-        }).unwrap();
+        server
+            .update_section(UpdateSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                content: "Completely different content.".to_owned(),
+                options: None,
+            })
+            .unwrap();
 
         // Find the initial version and switch back to it.
-        let versions = server.section_versions(SectionVersionsParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let versions = server
+            .section_versions(SectionVersionsParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         let initial_version_id = versions[0].version_id.clone();
 
-        server.switch_section_version(SwitchSectionVersionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            version_id: initial_version_id,
-            options: None,
-        }).unwrap();
+        server
+            .switch_section_version(SwitchSectionVersionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                version_id: initial_version_id,
+                options: None,
+            })
+            .unwrap();
 
-        let restored = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
-        assert_eq!(restored.content, original_content, "content must match initial version after switch");
+        let restored = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            restored.content, original_content,
+            "content must match initial version after switch"
+        );
     }
 
     #[test]
     fn diff_section_versions_returns_structured_hunks() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let section_id = toc[0].section_id.clone();
 
-        server.update_section(UpdateSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            content: "New line one.\nNew line two.".to_owned(),
-            options: None,
-        }).unwrap();
+        server
+            .update_section(UpdateSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                content: "New line one.\nNew line two.".to_owned(),
+                options: None,
+            })
+            .unwrap();
 
-        let versions = server.section_versions(SectionVersionsParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let versions = server
+            .section_versions(SectionVersionsParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         assert!(versions.len() >= 2);
 
-        let diff = server.diff_section_versions(DiffSectionVersionsParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            from_version: versions[0].version_id.clone(),
-            to_version: versions[versions.len() - 1].version_id.clone(),
-        }).unwrap();
-        assert!(!diff.hunks.is_empty(), "diff between two versions must have at least one hunk");
+        let diff = server
+            .diff_section_versions(DiffSectionVersionsParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                from_version: versions[0].version_id.clone(),
+                to_version: versions[versions.len() - 1].version_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            !diff.hunks.is_empty(),
+            "diff between two versions must have at least one hunk"
+        );
     }
 
     #[test]
     fn create_and_list_and_restore_document_snapshot() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
-        let document = server.list_documents(ListDocumentsParams::default()).unwrap().remove(0);
-        server.manage_document_file(ManageDocumentFileParams { document_id: document.id.clone() }).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
+        let document = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap()
+            .remove(0);
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
 
         // Take a snapshot of the current state.
-        let snapshot = server.create_document_snapshot(CreateDocumentSnapshotParams {
-            document_id: document.id.clone(),
-            label: Some("baseline".to_owned()),
-            change_summary: None,
-        }).unwrap();
+        let snapshot = server
+            .create_document_snapshot(CreateDocumentSnapshotParams {
+                document_id: document.id.clone(),
+                label: Some("baseline".to_owned()),
+                change_summary: None,
+            })
+            .unwrap();
         assert_eq!(snapshot.document_id, document.id);
 
         // Mutate the document.
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: document.id.clone() }).unwrap();
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         let section_id = toc[0].section_id.clone();
-        server.update_section(UpdateSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-            content: "Post-snapshot edit.".to_owned(),
-            options: None,
-        }).unwrap();
+        server
+            .update_section(UpdateSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+                content: "Post-snapshot edit.".to_owned(),
+                options: None,
+            })
+            .unwrap();
 
         // List snapshots — should contain our baseline.
-        let infos = server.document_snapshots(DocumentSnapshotsParams {
-            document_id: document.id.clone(),
-        }).unwrap();
+        let infos = server
+            .document_snapshots(DocumentSnapshotsParams {
+                document_id: document.id.clone(),
+            })
+            .unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].label.as_deref(), Some("baseline"));
 
         // Restore the snapshot and verify content is back.
-        server.restore_document_snapshot(RestoreDocumentSnapshotParams {
-            document_id: document.id.clone(),
-            snapshot_id: snapshot.snapshot_id.clone(),
-        }).unwrap();
+        server
+            .restore_document_snapshot(RestoreDocumentSnapshotParams {
+                document_id: document.id.clone(),
+                snapshot_id: snapshot.snapshot_id.clone(),
+            })
+            .unwrap();
 
-        let restored_section = server.get_section(GetSectionParams {
-            document_id: document.id.clone(),
-            section_id: section_id.clone(),
-        }).unwrap();
+        let restored_section = server
+            .get_section(GetSectionParams {
+                document_id: document.id.clone(),
+                section_id: section_id.clone(),
+            })
+            .unwrap();
         assert_ne!(
-            restored_section.content,
-            "Post-snapshot edit.",
+            restored_section.content, "Post-snapshot edit.",
             "content must differ from post-snapshot state after restore"
         );
     }
@@ -3539,12 +4850,26 @@ mod tests {
     #[test]
     fn watcher_reloads_workspace_after_external_file_edit() {
         let workspace = TestWorkspace::new();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
 
         // Manage the document so we can verify identity survives the reload.
-        let docs = server.list_documents(ListDocumentsParams::default()).unwrap();
+        let docs = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap();
         let doc = &docs[0];
-        server.manage_document_file(ManageDocumentFileParams { document_id: doc.id.clone() }).unwrap();
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: doc.id.clone(),
+            })
+            .unwrap();
 
         let before_count = server.generation.read().unwrap().reload_count;
 
@@ -3552,7 +4877,8 @@ mod tests {
         fs::write(
             workspace.0.join("docs/architecture.md"),
             "# Architecture\n\nExternal update.\n\n## Storage\n\nStill filesystem.\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Wait for the debounce window (300 ms) plus rebuild time.
         std::thread::sleep(std::time::Duration::from_millis(700));
@@ -3564,15 +4890,32 @@ mod tests {
         );
 
         // The updated content should be visible through normal reads.
-        let docs_after = server.list_documents(ListDocumentsParams::default()).unwrap();
-        let doc_after = docs_after.iter().find(|d| d.id == doc.id).expect("managed document must survive reload");
-        let toc = server.table_of_contents(TableOfContentsParams { document_id: doc_after.id.clone() }).unwrap();
-        let root_section = toc.iter().find(|s| s.title == "Architecture").expect("root section present");
-        let sections = server.get_section(GetSectionParams {
-            document_id: doc_after.id.clone(),
-            section_id: root_section.section_id.clone(),
-        }).unwrap();
-        assert!(sections.content.contains("External update"), "section content should reflect external edit");
+        let docs_after = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap();
+        let doc_after = docs_after
+            .iter()
+            .find(|d| d.id == doc.id)
+            .expect("managed document must survive reload");
+        let toc = server
+            .table_of_contents(TableOfContentsParams {
+                document_id: doc_after.id.clone(),
+            })
+            .unwrap();
+        let root_section = toc
+            .iter()
+            .find(|s| s.title == "Architecture")
+            .expect("root section present");
+        let sections = server
+            .get_section(GetSectionParams {
+                document_id: doc_after.id.clone(),
+                section_id: root_section.section_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            sections.content.contains("External update"),
+            "section content should reflect external edit"
+        );
     }
 
     #[test]
@@ -3580,18 +4923,44 @@ mod tests {
         let workspace = TestWorkspace::new();
         // Add a second file that will be externally renamed.
         fs::create_dir_all(workspace.0.join("notes")).unwrap();
-        fs::write(workspace.0.join("notes/todo.md"), "# Todo\n\nOriginal task list.\n").unwrap();
-        let server = FilesystemVdsServer::open(&workspace.0).unwrap();
+        fs::write(
+            workspace.0.join("notes/todo.md"),
+            "# Todo\n\nOriginal task list.\n",
+        )
+        .unwrap();
+        let server = FilesystemVdsServer::open(
+            &workspace.0,
+            #[cfg(all(
+                feature = "semantic-search",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+        .unwrap();
 
-        let docs = server.list_documents(ListDocumentsParams::default()).unwrap();
+        let docs = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap();
         // Find the todo.md document by checking locations.
-        let todo_doc = docs.iter().find(|d| {
-            server.get_document_location(GetDocumentLocationParams { document_id: d.id.clone() })
-                .ok()
-                .map(|l| l.relative_path)
-                .as_deref() == Some("notes/todo.md")
-        }).expect("todo.md must be discovered").clone();
-        server.manage_document_file(ManageDocumentFileParams { document_id: todo_doc.id.clone() }).unwrap();
+        let todo_doc = docs
+            .iter()
+            .find(|d| {
+                server
+                    .get_document_location(GetDocumentLocationParams {
+                        document_id: d.id.clone(),
+                    })
+                    .ok()
+                    .map(|l| l.relative_path)
+                    .as_deref()
+                    == Some("notes/todo.md")
+            })
+            .expect("todo.md must be discovered")
+            .clone();
+        server
+            .manage_document_file(ManageDocumentFileParams {
+                document_id: todo_doc.id.clone(),
+            })
+            .unwrap();
 
         let managed_id = todo_doc.id.clone();
 
@@ -3599,22 +4968,27 @@ mod tests {
         fs::rename(
             workspace.0.join("notes/todo.md"),
             workspace.0.join("notes/tasks.md"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Wait for debounce + rebuild.
         std::thread::sleep(std::time::Duration::from_millis(700));
 
         // The document should still be discoverable by its original managed ID.
-        let docs_after = server.list_documents(ListDocumentsParams::default()).unwrap();
+        let docs_after = server
+            .list_documents(ListDocumentsParams::default())
+            .unwrap();
         let reconciled = docs_after.iter().find(|d| d.id == managed_id);
         assert!(
             reconciled.is_some(),
             "managed document ID must survive external rename; found IDs: {:?}",
             docs_after.iter().map(|d| &d.id).collect::<Vec<_>>()
         );
-        let reconciled_location = server.get_document_location(GetDocumentLocationParams {
-            document_id: managed_id.clone(),
-        }).unwrap();
+        let reconciled_location = server
+            .get_document_location(GetDocumentLocationParams {
+                document_id: managed_id.clone(),
+            })
+            .unwrap();
         assert_eq!(
             reconciled_location.relative_path.as_str(),
             "notes/tasks.md",

@@ -90,7 +90,7 @@ impl EmbeddingCache {
 
         let workspace_id = workspace_manifest["workspace_id"]
             .as_str()
-            .ok_or_else(|| CacheError::MissingWorkspaceId)?
+            .ok_or(CacheError::MissingWorkspaceId)?
             .to_owned();
 
         let cache_dir = platform_cache_dir()?
@@ -98,8 +98,7 @@ impl EmbeddingCache {
             .join("workspaces")
             .join(&workspace_id);
 
-        fs::create_dir_all(&cache_dir)
-            .map_err(|e| CacheError::Io(cache_dir.clone(), e))?;
+        fs::create_dir_all(&cache_dir).map_err(|e| CacheError::Io(cache_dir.clone(), e))?;
 
         let cache_file = cache_dir.join("embeddings.zst");
 
@@ -120,8 +119,8 @@ impl EmbeddingCache {
             });
         }
 
-        let compressed = fs::read(&self.cache_file)
-            .map_err(|e| CacheError::Io(self.cache_file.clone(), e))?;
+        let compressed =
+            fs::read(&self.cache_file).map_err(|e| CacheError::Io(self.cache_file.clone(), e))?;
 
         // Decompress
         let decompressed = zstd::decode_all(&compressed[..])
@@ -145,8 +144,7 @@ impl EmbeddingCache {
     fn save_data(&self, data: &EmbeddingCacheData) -> Result<(), CacheError> {
         // Ensure parent directory exists (may have been removed by parallel test cleanup)
         if let Some(parent) = self.cache_file.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| CacheError::Io(parent.to_path_buf(), e))?;
+            fs::create_dir_all(parent).map_err(|e| CacheError::Io(parent.to_path_buf(), e))?;
         }
 
         // Serialize with CRC (postcard automatically adds checksum)
@@ -159,8 +157,7 @@ impl EmbeddingCache {
 
         // Atomic write via temp file
         let temp_file = self.cache_file.with_extension("zst.tmp");
-        fs::write(&temp_file, compressed)
-            .map_err(|e| CacheError::Io(temp_file.clone(), e))?;
+        fs::write(&temp_file, compressed).map_err(|e| CacheError::Io(temp_file.clone(), e))?;
         fs::rename(&temp_file, &self.cache_file)
             .map_err(|e| CacheError::Io(self.cache_file.clone(), e))?;
 
@@ -271,9 +268,7 @@ impl EmbeddingCache {
     pub fn stats(&self) -> Result<CacheStats, CacheError> {
         let data = self.load_data()?;
         let file_size = if self.cache_file.exists() {
-            fs::metadata(&self.cache_file)
-                .map(|m| m.len())
-                .unwrap_or(0)
+            fs::metadata(&self.cache_file).map(|m| m.len()).unwrap_or(0)
         } else {
             0
         };
@@ -454,7 +449,12 @@ mod tests {
     fn opens_cache_for_workspace() {
         let workspace = TestWorkspace::new();
         let cache = EmbeddingCache::open(&workspace.root).unwrap();
-        assert!(cache.cache_file.to_string_lossy().contains(&workspace.workspace_id));
+        assert!(
+            cache
+                .cache_file
+                .to_string_lossy()
+                .contains(&workspace.workspace_id)
+        );
     }
 
     #[test]
@@ -490,9 +490,7 @@ mod tests {
             vector: vec![0.1, 0.2, 0.3],
         };
 
-        cache
-            .put(&section_id, "sha256:abc", &embedding)
-            .unwrap();
+        cache.put(&section_id, "sha256:abc", &embedding).unwrap();
 
         let result = cache
             .get(&section_id, "sha256:different", "test-model")
@@ -522,7 +520,11 @@ mod tests {
         assert_eq!(stats.uncompressed_bytes, 3072);
         // Compressed should be smaller (postcard + zstd overhead means ratio varies)
         assert!(stats.compressed_bytes < stats.uncompressed_bytes);
-        assert!(stats.compression_ratio > 1.0, "compression_ratio = {}", stats.compression_ratio);
+        assert!(
+            stats.compression_ratio > 1.0,
+            "compression_ratio = {}",
+            stats.compression_ratio
+        );
         println!(
             "Compression: {:.2}:1 ({} → {} bytes)",
             stats.compression_ratio, stats.uncompressed_bytes, stats.compressed_bytes

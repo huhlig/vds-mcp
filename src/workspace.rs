@@ -154,8 +154,8 @@ impl WorkspaceState {
                     .map(|(p, _)| p.clone());
                 if let Some(new_path) = matched_path {
                     if let Some(doc) = documents_by_path.get_mut(&new_path) {
-                        let content = fs::read(root.join(path_from_vds(&new_path)))
-                            .unwrap_or_default();
+                        let content =
+                            fs::read(root.join(path_from_vds(&new_path))).unwrap_or_default();
                         reconcile_managed_document(doc, metadata, &content);
                         paths_by_id.insert(id.clone(), new_path.clone());
                     }
@@ -195,6 +195,35 @@ impl WorkspaceState {
         self.paths_by_id
             .get(document_id)
             .and_then(|path| self.documents_by_path.get(path))
+    }
+
+    /// Applies embeddings to sections across all documents.
+    ///
+    /// Takes a map of document_id -> (section_id -> embedding) and updates
+    /// the corresponding sections in place. This is used to populate embeddings
+    /// after they're generated asynchronously.
+    #[cfg(all(
+        feature = "semantic-search",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    pub fn apply_embeddings(
+        &mut self,
+        embeddings: BTreeMap<
+            DocumentId,
+            BTreeMap<crate::document::SectionId, crate::document::TextEmbedding>,
+        >,
+    ) {
+        for (doc_id, section_embeddings) in embeddings {
+            if let Some(path) = self.paths_by_id.get(&doc_id)
+                && let Some(doc) = self.documents_by_path.get_mut(path)
+            {
+                for section in &mut doc.sections {
+                    if let Some(embedding) = section_embeddings.get(&section.section_id) {
+                        section.embedding = Some(embedding.clone());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -460,7 +489,7 @@ fn section_ancestry(
 }
 
 fn sha256(contents: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(contents))
+    format!("sha256:{}", hex::encode(Sha256::digest(contents)))
 }
 
 fn normalize_separators(path: &str) -> String {
@@ -531,14 +560,13 @@ struct IgnoreRule {
 
 impl IgnoreRule {
     fn matches(&self, relative_path: &str, is_directory: bool) -> bool {
-        if let Some(prefix) = &self.directory_prefix {
-            if relative_path == prefix
+        if let Some(prefix) = &self.directory_prefix
+            && (relative_path == prefix
                 || relative_path
                     .strip_prefix(prefix)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-            {
-                return true;
-            }
+                    .is_some_and(|suffix| suffix.starts_with('/')))
+        {
+            return true;
         }
 
         if self.has_separator {
@@ -574,6 +602,8 @@ pub enum WorkspaceError {
     Metadata(MetadataError),
     /// Another VDS writer process already holds the workspace write lease.
     Lease(crate::metadata::LeaseError),
+    /// Other error with a descriptive message.
+    Other(String),
 }
 
 impl WorkspaceError {
@@ -622,6 +652,7 @@ impl fmt::Display for WorkspaceError {
             ),
             Self::Metadata(error) => write!(formatter, "metadata error: {error}"),
             Self::Lease(error) => write!(formatter, "{error}"),
+            Self::Other(message) => write!(formatter, "{message}"),
         }
     }
 }
@@ -631,6 +662,7 @@ impl std::error::Error for WorkspaceError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Metadata(error) => Some(error),
+            Self::Other(_) => None,
             Self::Lease(error) => Some(error),
             _ => None,
         }

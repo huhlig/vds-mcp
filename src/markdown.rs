@@ -20,114 +20,15 @@
 //! helpers parse Markdown into a stable section tree for storage, and render a
 //! stored section tree back into Markdown in sibling ordinal order.
 
-use std::fs;
-use std::path::Path;
-
 use crate::document::{
     Document, DocumentFormat, DocumentId, DocumentMetadata, Section, SectionId, SectionMetadata,
     SectionVersion, VersionId,
 };
-use crate::storage::{DocumentStore, Result};
+
 use chrono::Utc;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-/// Imports a Markdown file into storage and returns the created document.
-///
-/// The importer creates a synthetic root section, uses `pulldown_cmark` to find
-/// Markdown headings, stores initial section versions, and persists everything
-/// in one transaction.
-pub fn import_markdown_file(
-    store: &DocumentStore,
-    name: impl Into<String>,
-    path: impl AsRef<Path>,
-) -> Result<Document> {
-    let path = path.as_ref();
-    let markdown = fs::read_to_string(path)?;
-    import_markdown_str(
-        store,
-        name,
-        Some(path.to_string_lossy().into_owned()),
-        &markdown,
-    )
-}
-
-/// Imports Markdown content into storage and returns the created document.
-///
-/// Content before the first heading is stored on the synthetic root section.
-/// Heading detection is delegated to `pulldown_cmark`, so headings inside code
-/// blocks are ignored and CommonMark heading forms are handled consistently.
-/// Section parentage is inferred from heading levels, so an `h3` becomes the
-/// nearest descendant of the preceding lower-level heading.
-pub fn import_markdown_str(
-    store: &DocumentStore,
-    name: impl Into<String>,
-    source_path: Option<String>,
-    markdown: &str,
-) -> Result<Document> {
-    let name = name.into();
-    let imported = parse_markdown_str(name, source_path, markdown);
-    store.store_document_state(
-        &imported.document,
-        &imported.sections,
-        &imported.versions,
-        &[],
-    )?;
-    Ok(imported.document)
-}
-
-/// Exports a stored document to a Markdown file.
-///
-/// Sections are rendered by walking the stored tree from the document root and
-/// visiting children in ordinal order.
-pub fn export_markdown_file(
-    store: &DocumentStore,
-    document_id: &DocumentId,
-    path: impl AsRef<Path>,
-) -> Result<u64> {
-    let markdown = export_markdown_string(store, document_id)?;
-    fs::write(path, markdown.as_bytes())?;
-    Ok(markdown.len() as u64)
-}
-
-/// Exports a stored document to a Markdown string.
-///
-/// The synthetic root section's title is not rendered. Its direct content is
-/// emitted first, followed by all child sections recursively.
-pub fn export_markdown_string(store: &DocumentStore, document_id: &DocumentId) -> Result<String> {
-    let Some(document) = store.get_document(document_id)? else {
-        return Ok(String::new());
-    };
-    let Some(root) = store.get_section(&document.root)? else {
-        return Ok(String::new());
-    };
-
-    let mut markdown = String::new();
-    append_root_content(&mut markdown, &root.content);
-    append_children(store, document_id, Some(&document.root), &mut markdown)?;
-    Ok(markdown)
-}
-
-/// Renders one section subtree as Markdown.
-///
-/// Unlike whole-document export, the requested section heading is included in
-/// the output before its content and descendants.
-pub fn render_section_markdown_string(
-    store: &DocumentStore,
-    document_id: &DocumentId,
-    section_id: &SectionId,
-    include_children: bool,
-) -> Result<String> {
-    let Some(section) = store.get_section(section_id)? else {
-        return Ok(String::new());
-    };
-
-    let mut markdown = String::new();
-    append_section(&mut markdown, &section);
-    if include_children {
-        append_children(store, document_id, Some(section_id), &mut markdown)?;
-    }
-    Ok(markdown)
-}
+// ── VDS 2 Filesystem-authoritative types ──────────────────────────────────────
 
 /// Byte offsets locating one section within its source Markdown file.
 ///
@@ -156,6 +57,8 @@ pub struct ParsedMarkdown {
     /// The root section is not included (it has no heading line).
     pub source_spans: std::collections::BTreeMap<crate::document::SectionId, SectionSourceSpan>,
 }
+
+// ── VDS 2 Filesystem-authoritative functions ─────────────────────────────────
 
 /// Applies a content replacement to one section in raw Markdown.
 ///
@@ -264,12 +167,12 @@ fn render_one_section(markdown: &mut String, section: &Section) {
     markdown.push_str(&section.title);
     // Preserve the heading ID attribute so structural mutations don't silently
     // drop custom anchors that other documents or external links depend on.
-    if let Some(anchor) = &section.metadata.anchor {
-        if !anchor.is_empty() {
-            markdown.push_str(" {#");
-            markdown.push_str(anchor);
-            markdown.push('}');
-        }
+    if let Some(anchor) = &section.metadata.anchor
+        && !anchor.is_empty()
+    {
+        markdown.push_str(" {#");
+        markdown.push_str(anchor);
+        markdown.push('}');
     }
     markdown.push('\n');
     let content = section.content.trim_end();
@@ -556,58 +459,8 @@ fn section_content(markdown: &str, headings: &[HeadingSpan], index: usize) -> St
     trim_boundary_line_breaks(&markdown[start..end])
 }
 
-fn append_children(
-    store: &DocumentStore,
-    document_id: &DocumentId,
-    parent_id: Option<&SectionId>,
-    markdown: &mut String,
-) -> Result<()> {
-    for child in store.list_child_sections(document_id, parent_id)? {
-        append_section(markdown, &child);
-        append_children(store, document_id, Some(&child.section_id), markdown)?;
-    }
-    Ok(())
-}
-
-fn append_section(markdown: &mut String, section: &Section) {
-    ensure_blank_line(markdown);
-    let level = section.level.clamp(1, 6) as usize;
-    markdown.push_str(&"#".repeat(level));
-    markdown.push(' ');
-    markdown.push_str(&section.title);
-    markdown.push_str("\n\n");
-
-    let content = trim_trailing_blank_lines(&section.content);
-    if !content.is_empty() {
-        markdown.push_str(&content);
-        markdown.push('\n');
-    }
-}
-
-fn append_root_content(markdown: &mut String, content: &str) {
-    let content = trim_trailing_blank_lines(content);
-    if !content.is_empty() {
-        markdown.push_str(&content);
-        markdown.push('\n');
-    }
-}
-
-fn ensure_blank_line(markdown: &mut String) {
-    if markdown.is_empty() {
-        return;
-    }
-    if !markdown.ends_with('\n') {
-        markdown.push('\n');
-    }
-    if !markdown.ends_with("\n\n") {
-        markdown.push('\n');
-    }
-}
-
 fn trim_trailing_blank_lines(value: &str) -> String {
-    value
-        .trim_end_matches(|char| char == '\n' || char == '\r')
-        .to_owned()
+    value.trim_end_matches(['\n', '\r']).to_owned()
 }
 
 fn trim_boundary_line_breaks(value: &str) -> String {
@@ -651,29 +504,27 @@ fn new_version_id() -> VersionId {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashMap;
 
-    use super::*;
-    use uuid::Uuid;
-
     #[test]
-    fn imports_headings_into_tree_and_exports_in_order() {
+    fn test_parse_markdown_basic() {
         let markdown =
             "# Title\n\nIntro\n\n## A\n\nA body\n\n### A.1\n\nNested\n\n## B\n\nB body\n";
         let imported = parse_markdown_str("guide", None, markdown);
-        let sections_by_id = imported
+        let sections_map: std::collections::HashMap<_, _> = imported
             .sections
             .iter()
             .map(|section| (section.section_id.clone(), section))
-            .collect::<HashMap<_, _>>();
-        let root = sections_by_id.get(&imported.document.root).unwrap();
+            .collect();
+        let root = sections_map.get(&imported.document.root).unwrap();
 
         assert_eq!(root.children.len(), 1);
-        let title = sections_by_id.get(&root.children[0]).unwrap();
+        let title = sections_map.get(&root.children[0]).unwrap();
         assert_eq!(title.title, "Title");
         assert_eq!(title.children.len(), 2);
 
-        let first_child = sections_by_id.get(&title.children[0]).unwrap();
+        let first_child = sections_map.get(&title.children[0]).unwrap();
         assert_eq!(first_child.title, "A");
         assert_eq!(first_child.children.len(), 1);
         assert_eq!(imported.versions.len(), imported.sections.len());
@@ -688,42 +539,16 @@ mod tests {
     }
 
     #[test]
-    fn imports_to_storage_and_exports_markdown_in_tree_order() {
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-dbs")
-            .join(format!("{}.redb", Uuid::now_v7()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        let store = DocumentStore::open(path).unwrap();
-        let document = import_markdown_str(
-            &store,
-            "guide",
-            None,
-            "# Title\n\nIntro\n\n## B\n\nB body\n\n## A\n\nA body\n",
-        )
-        .unwrap();
-
-        let markdown = export_markdown_string(&store, &document.id).unwrap();
-
-        assert_eq!(
-            markdown,
-            "# Title\n\nIntro\n\n## B\n\nB body\n\n## A\n\nA body\n"
-        );
-    }
-
-    #[test]
     fn imports_overview_fixture_as_addressable_sections() {
         let overview = include_str!("../docs/overview.md");
         let imported =
             parse_markdown_str("overview", Some("docs/overview.md".to_owned()), overview);
-        let sections_by_id = imported
+        let sections_map: std::collections::HashMap<_, _> = imported
             .sections
             .iter()
             .map(|section| (section.section_id.clone(), section))
-            .collect::<HashMap<_, _>>();
-        let root = sections_by_id.get(&imported.document.root).unwrap();
+            .collect();
+        let root = sections_map.get(&imported.document.root).unwrap();
 
         assert_eq!(imported.document.name, "overview");
         assert_eq!(
@@ -736,13 +561,13 @@ mod tests {
         );
         assert_eq!(root.children.len(), 1);
 
-        let title = sections_by_id.get(&root.children[0]).unwrap();
+        let title = sections_map.get(&root.children[0]).unwrap();
         assert_eq!(
             title.title,
             "Versioned Document Service \u{2014} Architecture Overview"
         );
         assert!(title.children.iter().any(|child| {
-            sections_by_id
+            sections_map
                 .get(child)
                 .is_some_and(|section| section.title == "Document Model")
         }));
@@ -756,7 +581,9 @@ mod tests {
         // ATX headings may optionally close with trailing `#` characters.
         let md = "# Intro #\n\nBody.\n\n## Sub ##\n\nSub body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let sects: Vec<_> = parsed.sections.iter()
+        let sects: Vec<_> = parsed
+            .sections
+            .iter()
             .filter(|s| s.parent_id.is_some())
             .collect();
         assert_eq!(sects.len(), 2);
@@ -770,7 +597,9 @@ mod tests {
         // H3 should be a child of H1, not a grandchild of a phantom H2.
         let md = "# Root\n\nIntro.\n\n### Deep\n\nDeep body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_id: std::collections::HashMap<_, _> = parsed.sections.iter()
+        let by_id: std::collections::HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s))
             .collect();
         let root_node = by_id.get(&parsed.document.root).unwrap();
@@ -790,7 +619,9 @@ mod tests {
     fn setext_h1_and_h2_are_treated_as_headings() {
         let md = "Title\n=====\n\nIntro.\n\nSubsection\n----------\n\nSub body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_id: std::collections::HashMap<_, _> = parsed.sections.iter()
+        let by_id: std::collections::HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s))
             .collect();
         let root_node = by_id.get(&parsed.document.root).unwrap();
@@ -809,20 +640,30 @@ mod tests {
     fn setext_content_is_preserved_through_source_span_edit() {
         let md = "Title\n=====\n\nIntro.\n\nSubsection\n----------\n\nOriginal body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_id: std::collections::HashMap<_, _> = parsed.sections.iter()
+        let by_id: std::collections::HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s))
             .collect();
         let root_node = by_id.get(&parsed.document.root).unwrap();
         let h1 = by_id.get(&root_node.children[0]).unwrap();
         let h2 = by_id.get(&h1.children[0]).unwrap();
 
-        let span = parsed.source_spans.get(&h2.section_id)
+        let span = parsed
+            .source_spans
+            .get(&h2.section_id)
             .expect("source span must exist for setext H2");
-        let updated = apply_content_edit(md, span, "Updated body.")
-            .expect("content edit on setext heading");
+        let updated =
+            apply_content_edit(md, span, "Updated body.").expect("content edit on setext heading");
         assert!(updated.contains("Updated body."), "new content present");
-        assert!(updated.contains("Title\n====="), "H1 setext heading preserved");
-        assert!(updated.contains("Subsection\n----------"), "H2 setext heading preserved");
+        assert!(
+            updated.contains("Title\n====="),
+            "H1 setext heading preserved"
+        );
+        assert!(
+            updated.contains("Subsection\n----------"),
+            "H2 setext heading preserved"
+        );
         assert!(!updated.contains("Original body."), "old content removed");
     }
 
@@ -832,7 +673,9 @@ mod tests {
     fn duplicate_heading_titles_produce_distinct_sections() {
         let md = "# Doc\n\n## Results\n\nFirst.\n\n## Results\n\nSecond.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let results: Vec<_> = parsed.sections.iter()
+        let results: Vec<_> = parsed
+            .sections
+            .iter()
             .filter(|s| s.title == "Results")
             .collect();
         assert_eq!(results.len(), 2, "both duplicate headings become sections");
@@ -848,19 +691,27 @@ mod tests {
     fn duplicate_headings_each_have_distinct_source_spans() {
         let md = "# Doc\n\n## Dup\n\nFirst.\n\n## Dup\n\nSecond.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let dups: Vec<_> = parsed.sections.iter()
+        let dups: Vec<_> = parsed
+            .sections
+            .iter()
             .filter(|s| s.title == "Dup")
             .collect();
         assert_eq!(dups.len(), 2);
-        let span0 = parsed.source_spans.get(&dups[0].section_id)
+        let span0 = parsed
+            .source_spans
+            .get(&dups[0].section_id)
             .expect("span for first Dup");
-        let span1 = parsed.source_spans.get(&dups[1].section_id)
+        let span1 = parsed
+            .source_spans
+            .get(&dups[1].section_id)
             .expect("span for second Dup");
-        assert!(span0.heading_start < span1.heading_start, "spans are in order");
+        assert!(
+            span0.heading_start < span1.heading_start,
+            "spans are in order"
+        );
 
         // Content edit on first duplicate must not touch the second.
-        let updated = apply_content_edit(md, span0, "Replaced.")
-            .expect("edit on first dup");
+        let updated = apply_content_edit(md, span0, "Replaced.").expect("edit on first dup");
         assert!(updated.contains("Replaced."), "first replaced");
         assert!(updated.contains("Second."), "second untouched");
     }
@@ -871,12 +722,17 @@ mod tests {
     fn unicode_heading_titles_and_content_are_preserved() {
         let md = "# 文档标题\n\n这是正文。\n\n## Ärger mit Umlauten\n\nUmlauts: äöüß.\n\n## 🚀 Rockets\n\nEmoji content: 🎉\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: std::collections::HashMap<_, _> = parsed.sections.iter()
+        let by_title: std::collections::HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
         assert!(by_title.contains_key("文档标题"), "CJK title parsed");
         assert_eq!(by_title["文档标题"].content, "这是正文。");
-        assert!(by_title.contains_key("Ärger mit Umlauten"), "umlaut title parsed");
+        assert!(
+            by_title.contains_key("Ärger mit Umlauten"),
+            "umlaut title parsed"
+        );
         assert_eq!(by_title["Ärger mit Umlauten"].content, "Umlauts: äöüß.");
         assert!(by_title.contains_key("🚀 Rockets"), "emoji title parsed");
         assert_eq!(by_title["🚀 Rockets"].content, "Emoji content: 🎉");
@@ -887,12 +743,16 @@ mod tests {
         // Byte offsets must be correct for multi-byte Unicode characters.
         let md = "# 标题\n\n原始内容。\n\n## Sub\n\nSub body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let cjk = parsed.sections.iter().find(|s| s.title == "标题")
+        let cjk = parsed
+            .sections
+            .iter()
+            .find(|s| s.title == "标题")
             .expect("CJK section");
-        let span = parsed.source_spans.get(&cjk.section_id)
+        let span = parsed
+            .source_spans
+            .get(&cjk.section_id)
             .expect("span for CJK section");
-        let updated = apply_content_edit(md, span, "新内容。")
-            .expect("edit on CJK section");
+        let updated = apply_content_edit(md, span, "新内容。").expect("edit on CJK section");
         assert!(updated.contains("新内容。"), "new CJK content written");
         assert!(!updated.contains("原始内容。"), "old CJK content removed");
         assert!(updated.contains("## Sub"), "other section untouched");
@@ -904,71 +764,68 @@ mod tests {
     fn empty_sections_parse_and_round_trip_without_content() {
         let md = "# Doc\n\n## Empty\n\n## HasContent\n\nBody.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: std::collections::HashMap<_, _> = parsed.sections.iter()
+        let by_title: std::collections::HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        assert_eq!(by_title["Empty"].content, "", "empty section has no content");
+        assert_eq!(
+            by_title["Empty"].content, "",
+            "empty section has no content"
+        );
         assert_eq!(by_title["HasContent"].content, "Body.");
 
         // Source span edit on empty section should insert content cleanly.
-        let empty_span = parsed.source_spans.get(&by_title["Empty"].section_id)
+        let empty_span = parsed
+            .source_spans
+            .get(&by_title["Empty"].section_id)
             .expect("span for empty section");
         let updated = apply_content_edit(md, empty_span, "Now has content.")
             .expect("insert into empty section");
-        assert!(updated.contains("## Empty\n\nNow has content."), "content inserted after empty heading");
-        assert!(updated.contains("## HasContent"), "following section untouched");
+        assert!(
+            updated.contains("## Empty\n\nNow has content."),
+            "content inserted after empty heading"
+        );
+        assert!(
+            updated.contains("## HasContent"),
+            "following section untouched"
+        );
     }
 
     #[test]
     fn consecutive_empty_sections_all_get_distinct_spans() {
         let md = "# Doc\n\n## A\n\n## B\n\n## C\n\nOnly C has content.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: std::collections::HashMap<_, _> = parsed.sections.iter()
+        let by_title: std::collections::HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
         assert_eq!(by_title["A"].content, "");
         assert_eq!(by_title["B"].content, "");
         assert_eq!(by_title["C"].content, "Only C has content.");
 
-        let span_a = parsed.source_spans.get(&by_title["A"].section_id).expect("span A");
-        let span_b = parsed.source_spans.get(&by_title["B"].section_id).expect("span B");
-        let span_c = parsed.source_spans.get(&by_title["C"].section_id).expect("span C");
+        let span_a = parsed
+            .source_spans
+            .get(&by_title["A"].section_id)
+            .expect("span A");
+        let span_b = parsed
+            .source_spans
+            .get(&by_title["B"].section_id)
+            .expect("span B");
+        let span_c = parsed
+            .source_spans
+            .get(&by_title["C"].section_id)
+            .expect("span C");
 
         assert!(span_a.heading_start < span_b.heading_start);
         assert!(span_b.heading_start < span_c.heading_start);
 
         // Edit B (empty) without disturbing A or C.
-        let updated = apply_content_edit(md, span_b, "B content.")
-            .expect("insert into empty B");
+        let updated = apply_content_edit(md, span_b, "B content.").expect("insert into empty B");
         assert!(updated.contains("## B\n\nB content."), "B content inserted");
         assert!(updated.contains("## A\n\n## B"), "A still empty");
         assert!(updated.contains("Only C has content."), "C untouched");
-    }
-
-    #[test]
-    fn overview_fixture_round_trips_key_markdown_sections() {
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-dbs")
-            .join(format!("{}.redb", Uuid::now_v7()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        let store = DocumentStore::open(path).unwrap();
-        let document = import_markdown_str(
-            &store,
-            "overview",
-            Some("docs/overview.md".to_owned()),
-            include_str!("../docs/overview.md"),
-        )
-        .unwrap();
-
-        let markdown = export_markdown_string(&store, &document.id).unwrap();
-
-        assert!(markdown.contains("# Versioned Document Service"));
-        assert!(markdown.contains("## Document Model"));
-        assert!(markdown.contains("## Mutation Durability"));
-        assert!(markdown.contains("## Module Map"));
     }
 
     // ── Golden: apply_content_edit exact output ───────────────────────────────
@@ -977,10 +834,15 @@ mod tests {
     fn golden_content_edit_middle_section() {
         let md = "# Doc\n\nPreamble.\n\n## Alpha\n\nOriginal alpha.\n\n## Beta\n\nBeta body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Alpha"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Alpha"].section_id)
+            .unwrap();
         let result = apply_content_edit(md, span, "Replaced alpha.").unwrap();
         assert_eq!(
             result,
@@ -992,10 +854,15 @@ mod tests {
     fn golden_content_edit_last_section() {
         let md = "# Doc\n\n## First\n\nFirst body.\n\n## Last\n\nOriginal last.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Last"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Last"].section_id)
+            .unwrap();
         let result = apply_content_edit(md, span, "New last body.").unwrap();
         assert_eq!(
             result,
@@ -1007,10 +874,15 @@ mod tests {
     fn golden_content_edit_empty_to_nonempty() {
         let md = "# Doc\n\n## Empty\n\n## After\n\nAfter body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Empty"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Empty"].section_id)
+            .unwrap();
         let result = apply_content_edit(md, span, "Now has content.").unwrap();
         assert_eq!(
             result,
@@ -1022,15 +894,17 @@ mod tests {
     fn golden_content_edit_nonempty_to_empty() {
         let md = "# Doc\n\n## Section\n\nHas content.\n\n## After\n\nAfter body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Section"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Section"].section_id)
+            .unwrap();
         let result = apply_content_edit(md, span, "").unwrap();
-        assert_eq!(
-            result,
-            "# Doc\n\n## Section\n\n## After\n\nAfter body.\n"
-        );
+        assert_eq!(result, "# Doc\n\n## Section\n\n## After\n\nAfter body.\n");
     }
 
     // ── Golden: apply_heading_rename exact output ─────────────────────────────
@@ -1039,10 +913,15 @@ mod tests {
     fn golden_heading_rename_middle_section() {
         let md = "# Doc\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Alpha"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Alpha"].section_id)
+            .unwrap();
         let result = apply_heading_rename(md, span, "Renamed").unwrap();
         assert_eq!(
             result,
@@ -1053,12 +932,18 @@ mod tests {
     #[test]
     fn golden_heading_rename_only_heading_line_changes() {
         // The content below the renamed heading must be byte-for-byte identical.
-        let md = "# Title\n\n## Section\n\nContent line 1.\nContent line 2.\n\nStill same section.\n";
+        let md =
+            "# Title\n\n## Section\n\nContent line 1.\nContent line 2.\n\nStill same section.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Section"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Section"].section_id)
+            .unwrap();
         let result = apply_heading_rename(md, span, "New Name").unwrap();
         assert_eq!(
             result,
@@ -1082,10 +967,15 @@ mod tests {
             "Original other.\n",
         );
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Other"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Other"].section_id)
+            .unwrap();
         let result = apply_content_edit(md, span, "New other.").unwrap();
 
         // Fenced code block must survive byte-for-byte.
@@ -1106,13 +996,21 @@ mod tests {
             "```\n",
         );
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
         // The "# This is a comment" inside the fence must NOT become a section.
-        assert_eq!(parsed.sections.len(), 2, "root + Snippet only — no phantom heading");
+        assert_eq!(
+            parsed.sections.len(),
+            2,
+            "root + Snippet only — no phantom heading"
+        );
         assert!(
-            by_title["Snippet"].content.contains("# This is a comment, not a heading"),
+            by_title["Snippet"]
+                .content
+                .contains("# This is a comment, not a heading"),
             "code comment stored verbatim in section content"
         );
     }
@@ -1130,14 +1028,25 @@ mod tests {
             "Original B.\n",
         );
         let parsed = parse_markdown_str("doc", None, md);
-        let by_title: HashMap<_, _> = parsed.sections.iter()
+        let by_title: HashMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.title.as_str(), s))
             .collect();
-        let span = parsed.source_spans.get(&by_title["Section B"].section_id).unwrap();
+        let span = parsed
+            .source_spans
+            .get(&by_title["Section B"].section_id)
+            .unwrap();
         let result = apply_content_edit(md, span, "New B.").unwrap();
 
-        assert!(result.contains("<!-- This is a top-level comment -->"), "top-level comment preserved");
-        assert!(result.contains("<!-- inline comment -->"), "inline comment preserved");
+        assert!(
+            result.contains("<!-- This is a top-level comment -->"),
+            "top-level comment preserved"
+        );
+        assert!(
+            result.contains("<!-- inline comment -->"),
+            "inline comment preserved"
+        );
         assert!(result.contains("## Section B\n\nNew B.\n"), "edit applied");
     }
 
@@ -1147,7 +1056,9 @@ mod tests {
     fn golden_render_preserves_heading_id_attribute() {
         let md = "# Doc {#doc-anchor}\n\nPreamble.\n\n## Sub {#sub-anchor}\n\nSub body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let sections_map: std::collections::BTreeMap<_, _> = parsed.sections.iter()
+        let sections_map: std::collections::BTreeMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s.clone()))
             .collect();
 
@@ -1168,7 +1079,9 @@ mod tests {
         // Simple 3-section tree; confirm byte-exact canonical render output.
         let md = "# Title\n\nIntro.\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n";
         let parsed = parse_markdown_str("doc", None, md);
-        let sections_map: std::collections::BTreeMap<_, _> = parsed.sections.iter()
+        let sections_map: std::collections::BTreeMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s.clone()))
             .collect();
         let rendered = render_sections_to_markdown(&sections_map, &parsed.document.root);
@@ -1189,7 +1102,9 @@ mod tests {
             "Just run `vds`.\n",
         );
         let parsed = parse_markdown_str("doc", None, md);
-        let sections_map: std::collections::BTreeMap<_, _> = parsed.sections.iter()
+        let sections_map: std::collections::BTreeMap<_, _> = parsed
+            .sections
+            .iter()
             .map(|s| (s.section_id.clone(), s.clone()))
             .collect();
         let rendered = render_sections_to_markdown(&sections_map, &parsed.document.root);
